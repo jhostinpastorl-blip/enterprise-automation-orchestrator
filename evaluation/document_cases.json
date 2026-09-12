@@ -1,0 +1,20 @@
+[
+  {
+    "id": "invoice-001",
+    "text": "Invoice INV-1001 from ACME Corp. Customer C-42. Total amount USD 1250.00.",
+    "expected_document_type": "invoice",
+    "required_fields": ["invoice_number", "supplier"]
+  },
+  {
+    "id": "purchase-order-001",
+    "text": "Purchase Order PO-7788 issued to Northwind Supplies for 25 units. Delivery requested next week.",
+    "expected_document_type": "purchase_order",
+    "required_fields": ["purchase_order_number", "supplier"]
+  },
+  {
+    "id": "ambiguous-001",
+    "text": "Scanned note: please process this request as discussed with operations.",
+    "expected_document_type": "unknown",
+    "required_fields": []
+  }
+]
