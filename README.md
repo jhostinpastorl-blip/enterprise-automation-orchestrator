@@ -15,6 +15,8 @@ This repository is intentionally built around orchestration rather than a specif
 - bounded retries and dead-letter state
 - append-only lifecycle audit events
 - basic operational metrics
+- optional LLM document enrichment with typed output and human-review guardrails
+- repeatable enrichment evaluation harness
 - Docker-based local API + worker setup
 - automated tests in GitHub Actions
 - architecture decisions recorded as ADRs
@@ -26,32 +28,32 @@ This repository is intentionally built around orchestration rather than a specif
                          |      API client      |
                          +----------+-----------+
                                     |
-                                    | POST /automation-requests
-                                    v
-+------------------+       +--------+---------+       +-------------------+
-| audit / metrics  | <---- |     FastAPI      | ----> | durable request   |
-+------------------+       +------------------+       | state + queue     |
-                                                      +---------+---------+
-                                                                |
-                                                                | claim
-                                                                v
-                                                      +---------+---------+
-                                                      | automation worker |
-                                                      +----+----------+---+
-                                                           |          |
-                                                  API path |          | RPA path
-                                                           v          v
-                                                   +-------+--+   +---+----------------+
-                                                   | HTTP API |   | RPA platform /     |
-                                                   | adapter  |   | gateway adapter    |
-                                                   +----------+   +--------------------+
+                    optional        | POST /automation-requests
+                 document enrich    v
+              +----------------+  +--------+---------+       +-------------------+
+              | LLM boundary   |  |     FastAPI      | ----> | durable request   |
+              | + HITL flag    |  +------------------+       | state + queue     |
+              +----------------+                              +---------+---------+
+                                                                      |
+                                                                      | claim
+                                                                      v
+                                                            +---------+---------+
+                                                            | automation worker |
+                                                            +----+----------+---+
+                                                                 |          |
+                                                        API path |          | RPA path
+                                                                 v          v
+                                                         +-------+--+   +---+----------------+
+                                                         | HTTP API |   | RPA platform /     |
+                                                         | adapter  |   | gateway adapter    |
+                                                         +----------+   +--------------------+
 ```
 
-The core decision is simple: use a stable API when one exists. Use RPA when the operation is only available through a user interface or a legacy application. The orchestration layer should not force every integration into a bot workflow.
+The core decision is simple: use a stable API when one exists. Use RPA when the operation is only available through a user interface or a legacy application. Keep probabilistic AI enrichment outside the deterministic orchestration lifecycle.
 
 ## Integration layer
 
-The worker no longer simulates API/RPA success. Both execution paths use real HTTP clients and fail explicitly when integration configuration is missing.
+The worker does not simulate API/RPA success. Both execution paths use real HTTP clients and fail explicitly when integration configuration is missing.
 
 For direct API execution:
 
@@ -61,8 +63,6 @@ TARGET_API_TOKEN=...
 TARGET_API_TIMEOUT_SECONDS=10
 ```
 
-`request.target` is appended to the configured base URL and the request payload is posted as JSON.
-
 For RPA execution:
 
 ```text
@@ -71,39 +71,51 @@ RPA_SUBMIT_TOKEN=...
 RPA_SUBMIT_TIMEOUT_SECONDS=10
 ```
 
-The orchestrator submits a vendor-neutral job contract containing the process, target, payload and idempotency key. A production implementation can replace this HTTP gateway contract with a native UiPath or Automation Anywhere adapter without changing the orchestration lifecycle.
+The RPA path submits a vendor-neutral job contract. A production implementation can replace this adapter with a native UiPath or Automation Anywhere client without changing the orchestration lifecycle.
 
 This repository does **not** claim that a native vendor integration is already implemented.
 
-## Request lifecycle
+## Guarded document enrichment
 
-Successful execution:
+`POST /enrichment/documents` sends unstructured text to a configurable OpenAI-compatible endpoint and validates the returned JSON into a typed model.
+
+Expected output fields:
+
+```text
+document_type
+extracted_fields
+confidence
+requires_human_review
+provider
+model
+```
+
+Low-confidence output is marked for human review using the request's `review_threshold`. Invalid JSON, invalid confidence values, HTTP failures or missing configuration fail closed instead of silently passing bad model output into automation.
+
+Runtime configuration:
+
+```text
+LLM_BASE_URL=https://llm-provider.example/v1
+LLM_API_KEY=...
+LLM_MODEL=your-model
+LLM_TIMEOUT_SECONDS=20
+```
+
+The repository includes `evaluation/document_cases.json` and `scripts/evaluate_enrichment.py` so provider/model changes can be measured using the same case set. The included sample is synthetic and intentionally small; it is an evaluation harness, not a claim of production model accuracy.
+
+## Request lifecycle
 
 ```text
 queued -> running -> completed
 ```
 
-Transient failure:
-
-```text
-queued -> running -> retrying -> running -> completed
-```
-
-Exhausted retry budget:
-
-```text
-queued -> running -> retrying -> ... -> dead_letter
-```
-
-Every transition is appended to an audit table. The current state is stored separately so operational lookups do not have to rebuild state from the event history.
+Transient failures can move through `retrying`; exhausted retry budgets move to `dead_letter`. Every transition is appended to an audit table.
 
 ## Idempotency
 
-Clients can send an `idempotency_key`. Submitting the same key again returns the existing request instead of creating another unit of work. This is useful when a caller times out and cannot know whether its previous submission was accepted.
+Clients can send an `idempotency_key`. Re-submitting the same key returns the existing request instead of creating another unit of work.
 
 ## Run locally
-
-### Python
 
 ```bash
 python -m venv .venv
@@ -112,13 +124,19 @@ pip install -e .[dev]
 uvicorn app.main:app --reload
 ```
 
-Run the worker in another terminal after configuring the integration variables you want to exercise:
+Run the worker separately after configuring the integration variables you want to exercise:
 
 ```bash
 python -m app.worker
 ```
 
-### Docker Compose
+Run the optional LLM evaluation only when an endpoint/model is configured:
+
+```bash
+python scripts/evaluate_enrichment.py
+```
+
+Docker Compose:
 
 ```bash
 docker compose up --build
@@ -126,28 +144,12 @@ docker compose up --build
 
 Swagger/OpenAPI documentation is available at `http://127.0.0.1:8000/docs`.
 
-## Example
-
-Submit work:
-
-```bash
-curl -X POST http://127.0.0.1:8000/automation-requests \
-  -H "Content-Type: application/json" \
-  -d '{
-    "process":"customer_update",
-    "target":"crm/customers/C-10042",
-    "execution_channel":"api",
-    "payload":{"status":"active"},
-    "idempotency_key":"customer-C-10042-update"
-  }'
-```
-
-The API returns `202 Accepted` with a request ID and `queued` status. The worker later changes that state as it processes the request.
-
 Operational endpoints:
 
 ```text
 GET /health
+POST /automation-requests
+POST /enrichment/documents
 GET /automation-requests/{request_id}
 GET /automation-requests/{request_id}/audit
 GET /metrics
@@ -157,19 +159,11 @@ GET /metrics
 
 SQLite keeps the repository runnable with almost no infrastructure and is enough to demonstrate durable state, audit history and asynchronous processing locally.
 
-It is not presented as the final choice for a high-throughput distributed automation platform. A production design with multiple workers would normally move durable state to a production database and work dispatch to a queue/broker with atomic distributed consumption semantics.
-
-That boundary is deliberate: the API and worker depend on repository and adapter contracts rather than embedding SQL or vendor-specific RPA calls throughout the workflow.
-
-## Where AI fits
-
-AI is not added merely to label the project as "AI automation". The deterministic orchestration path should stay deterministic.
-
-A sensible extension would place document classification or unstructured-field extraction before routing, with structured outputs, confidence thresholds and human review for uncertain results. The execution, retry, idempotency and audit layers would remain the same.
+It is not presented as the final choice for a high-throughput distributed automation platform. A production design with multiple workers would normally move durable state to a production database and dispatch work through a queue/broker with distributed consumption semantics.
 
 ## Engineering decisions
 
-See `docs/decisions/` for short ADRs explaining persistence, asynchronous execution, AI boundaries and external integration design.
+See `docs/decisions/` for ADRs covering persistence, asynchronous execution, AI boundaries, external integration design and LLM guardrails.
 
 ## Roadmap
 
@@ -179,8 +173,9 @@ See `docs/decisions/` for short ADRs explaining persistence, asynchronous execut
 - [x] v0.4 - retry policy, idempotency and dead-letter state
 - [x] v0.5 - operational metrics, containerization and CI
 - [x] v0.6 - real HTTP integration layer for API and RPA execution paths
-- [ ] v0.7 - evaluated document/LLM enrichment with structured output and human review
+- [x] v0.7 - guarded document/LLM enrichment with typed output, human review and evaluation harness
+- [ ] v0.8 - production database/queue adapter and distributed worker strategy
 
 ## Scope
 
-This is a portfolio/reference project, not a claim that this implementation should be dropped unchanged into production. Its purpose is to make design decisions explicit and to show how RPA can be one component inside a broader automation architecture.
+This is a portfolio/reference project, not a claim that this implementation should be dropped unchanged into production. Its purpose is to make design decisions explicit and to show how RPA, software, APIs and AI can coexist inside a broader automation architecture without pretending every component has the same reliability characteristics.
