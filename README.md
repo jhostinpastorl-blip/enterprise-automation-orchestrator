@@ -1,28 +1,29 @@
 # Enterprise Automation Orchestrator
 
-A reference implementation for a problem that appears often in enterprise automation: one business process may need direct APIs for some systems and RPA for others, while still requiring one place to track state, retries, audit history and operational controls.
+A reference implementation for enterprise automation where one business process may need direct APIs, RPA and optional AI enrichment while still requiring durable state, retries, auditability, security controls and observable execution.
 
-This repository is intentionally built around orchestration rather than forcing every integration into an RPA workflow.
+The design treats RPA as one execution mechanism inside a broader automation system rather than making the robot workflow the system of record.
 
 ## What it demonstrates
 
-- FastAPI contract with Pydantic validation
-- real HTTP API execution behind an adapter boundary
-- vendor-neutral HTTP submission to an external RPA platform/gateway
-- UiPath Orchestrator job submission through an OAuth/OData integration boundary
-- durable request state outside the robot workflow
-- asynchronous request acceptance and worker execution
-- idempotency keys for duplicate-submission protection
-- bounded retries and dead-letter state
+- FastAPI + Pydantic API contract
+- direct HTTP integrations behind adapter boundaries
+- vendor-neutral RPA gateway integration
+- UiPath Orchestrator OAuth/OData job submission boundary
+- SQLite for low-friction local development
+- PostgreSQL-compatible durable state through SQLAlchemy
+- atomic PostgreSQL worker claiming with `FOR UPDATE SKIP LOCKED`
+- optional Redis-backed work dispatch
+- multiple worker processes sharing one durable state store
+- idempotency, bounded retries and dead-letter state
 - append-only lifecycle audit events
-- correlation IDs and structured JSON logging
-- optional API-key protection for non-public endpoints
+- API-key protection, correlation IDs and structured JSON logging
 - JSON and Prometheus-style operational metrics
 - optional LLM document enrichment with typed output and human-review guardrails
-- repeatable enrichment evaluation harness
-- Docker-based local API + worker setup
+- repeatable LLM evaluation harness
+- Docker Compose topologies for local and distributed execution
 - automated tests in GitHub Actions
-- architecture decisions recorded as ADRs
+- ADRs documenting technical decisions and trade-offs
 
 ## Architecture
 
@@ -33,30 +34,72 @@ This repository is intentionally built around orchestration rather than forcing 
                                     |
                     optional        | POST /automation-requests
                  document enrich    v
-              +----------------+  +--------+---------+       +-------------------+
-              | LLM boundary   |  |     FastAPI      | ----> | durable request   |
-              | + HITL flag    |  | auth + tracing   |       | state + queue     |
-              +----------------+  +------------------+       +---------+---------+
-                                                                      |
-                                                                      | claim
-                                                                      v
-                                                            +---------+---------+
-                                                            | automation worker |
-                                                            +----+----------+---+
-                                                                 |          |
-                                                        API path |          | RPA path
-                                                                 v          v
-                                                         +-------+--+   +---+----------------+
-                                                         | HTTP API |   | RPA gateway or    |
-                                                         | adapter  |   | UiPath Orchestrator|
-                                                         +----------+   +--------------------+
+              +----------------+  +-------------------+
+              | LLM boundary   |  |      FastAPI      |
+              | + HITL flag    |  | auth + tracing    |
+              +----------------+  +---------+---------+
+                                           |
+                               persist     |     publish ID
+                                           v
+                                 +---------+---------+
+                                 |    PostgreSQL     |
+                                 | state + audit     |
+                                 +---------+---------+
+                                           |
+                                           |                 +-------------+
+                                           +---------------->|    Redis    |
+                                                             | dispatch    |
+                                                             +------+------+ 
+                                                                    |
+                                                      +-------------+-------------+
+                                                      |                           |
+                                                      v                           v
+                                             +--------+--------+         +--------+--------+
+                                             |    worker A     |         |    worker B     |
+                                             +---+---------+---+         +---+---------+---+
+                                                 |         |                 |         |
+                                            API  |         | RPA        API |         | RPA
+                                                 v         v                 v         v
+                                           HTTP APIs   UiPath/RPA      HTTP APIs   UiPath/RPA
 ```
 
-The core decision is simple: use a stable API when one exists. Use RPA when the operation is only available through a user interface or a legacy application. Keep probabilistic AI enrichment outside the deterministic orchestration lifecycle.
+PostgreSQL remains authoritative. Redis carries request IDs for dispatch only; workers must atomically claim the corresponding persisted request before execution. A duplicate or stale broker message therefore cannot by itself create a second execution claim.
+
+## State and dispatch modes
+
+The service supports two operating modes.
+
+### Local mode
+
+```text
+AUTOMATION_DB_PATH=automation.db
+DISPATCH_BACKEND=database
+```
+
+Workers poll durable state directly. SQLite keeps setup intentionally small for development and demonstrations.
+
+### Distributed mode
+
+```text
+AUTOMATION_DATABASE_URL=postgresql+psycopg://automation:automation@postgres:5432/automation
+DISPATCH_BACKEND=redis
+REDIS_URL=redis://redis:6379/0
+REDIS_QUEUE_NAME=automation:requests
+```
+
+The SQLAlchemy repository uses PostgreSQL row locking with `FOR UPDATE SKIP LOCKED` when multiple workers compete for eligible work. Redis provides broker-backed dispatch, while PostgreSQL continues to own lifecycle state, attempts, idempotency and audit history.
+
+Run the distributed reference topology:
+
+```bash
+docker compose -f compose.production.yaml up --build
+```
+
+The compose file starts PostgreSQL, Redis, the API and two workers. It is a reference topology, not a claim of production hardening or cloud deployment.
 
 ## Integration layer
 
-The worker does not simulate API/RPA success. Execution paths use real HTTP clients and fail explicitly when integration configuration is missing.
+The worker does not simulate external execution. Adapter paths use real HTTP clients and fail explicitly when configuration is missing.
 
 Direct API execution:
 
@@ -72,7 +115,6 @@ Vendor-neutral RPA gateway:
 RPA_PROVIDER=gateway
 RPA_SUBMIT_URL=https://rpa-gateway.example.internal/jobs
 RPA_SUBMIT_TOKEN=...
-RPA_SUBMIT_TIMEOUT_SECONDS=10
 ```
 
 UiPath Orchestrator:
@@ -87,64 +129,48 @@ UIPATH_RELEASE_KEY=...
 UIPATH_FOLDER_ID=...
 ```
 
-The UiPath adapter obtains a client-credentials access token and submits a job through the Orchestrator OData `StartJobs` surface. Configuration remains externalized so credentials are never committed to the repository.
+The UiPath adapter obtains a client-credentials token and submits a job through the Orchestrator OData `StartJobs` surface. It is contract-tested with mocked responses; this repository does not claim a live production UiPath tenant deployment.
 
-This is an implemented integration boundary with mocked contract tests; it is **not** presented as evidence of a live production UiPath tenant deployment from this repository.
+## Reliability model
+
+Normal execution:
+
+```text
+queued -> running -> completed
+```
+
+Transient failure:
+
+```text
+queued -> running -> retrying -> running -> completed
+```
+
+Exhausted retry budget:
+
+```text
+queued -> running -> retrying -> ... -> dead_letter
+```
+
+Clients can provide an `idempotency_key`; repeated submissions return the existing persisted request. Redis messages are intentionally treated as dispatch hints, not authoritative state.
 
 ## Security and observability
 
-When `ORCHESTRATOR_API_KEY` is configured, non-public endpoints require an `X-API-Key` header. `/health` and API documentation remain public for local/reference use.
+When `ORCHESTRATOR_API_KEY` is configured, non-public endpoints require `X-API-Key`. Every HTTP request receives an `X-Correlation-ID`, and logs are emitted as structured JSON with that identifier.
 
-Every HTTP request receives an `X-Correlation-ID`. A caller-provided ID is preserved; otherwise the service generates one. Logs are emitted as structured JSON and include that correlation ID so request-level troubleshooting can cross API and worker logs more easily.
-
-Operational metrics are exposed in two forms:
+Operational metrics:
 
 ```text
 GET /metrics
 GET /metrics/prometheus
 ```
 
-The Prometheus-style endpoint currently exposes request counts and lifecycle status counts. It is intentionally small; a production deployment would normally add latency histograms, worker throughput, retry counts, dead-letter counts and external dependency metrics.
+The current Prometheus-style metrics intentionally remain small. A real production deployment would normally add latency histograms, dependency timing, worker throughput, retry/dead-letter counters and distributed tracing.
 
 ## Guarded document enrichment
 
-`POST /enrichment/documents` sends unstructured text to a configurable OpenAI-compatible endpoint and validates the returned JSON into a typed model.
+`POST /enrichment/documents` calls a configurable OpenAI-compatible endpoint, validates structured output with Pydantic and marks low-confidence results for human review. Invalid or malformed model output fails closed rather than silently entering deterministic automation.
 
-Expected output fields:
-
-```text
-document_type
-extracted_fields
-confidence
-requires_human_review
-provider
-model
-```
-
-Low-confidence output is marked for human review using the request's `review_threshold`. Invalid JSON, invalid confidence values, HTTP failures or missing configuration fail closed instead of silently passing bad model output into automation.
-
-Runtime configuration:
-
-```text
-LLM_BASE_URL=https://llm-provider.example/v1
-LLM_API_KEY=...
-LLM_MODEL=your-model
-LLM_TIMEOUT_SECONDS=20
-```
-
-The repository includes `evaluation/document_cases.json` and `scripts/evaluate_enrichment.py` so provider/model changes can be measured using the same case set. The included sample is synthetic and intentionally small; it is an evaluation harness, not a claim of production model accuracy.
-
-## Request lifecycle
-
-```text
-queued -> running -> completed
-```
-
-Transient failures can move through `retrying`; exhausted retry budgets move to `dead_letter`. Every transition is appended to an audit table.
-
-## Idempotency
-
-Clients can send an `idempotency_key`. Re-submitting the same key returns the existing request instead of creating another unit of work.
+The included evaluation cases are synthetic and intentionally small. They demonstrate a repeatable evaluation workflow, not production model accuracy.
 
 ## Run locally
 
@@ -155,47 +181,29 @@ pip install -e .[dev]
 uvicorn app.main:app --reload
 ```
 
-Run the worker separately after configuring the integration variables you want to exercise:
+Run a worker in another terminal:
 
 ```bash
 python -m app.worker
 ```
 
-Run the optional LLM evaluation only when an endpoint/model is configured:
-
-```bash
-python scripts/evaluate_enrichment.py
-```
-
-Docker Compose:
+Local Docker topology:
 
 ```bash
 docker compose up --build
 ```
 
-Swagger/OpenAPI documentation is available at `http://127.0.0.1:8000/docs`.
+Distributed reference topology:
 
-Operational endpoints:
-
-```text
-GET /health
-POST /automation-requests
-POST /enrichment/documents
-GET /automation-requests/{request_id}
-GET /automation-requests/{request_id}/audit
-GET /metrics
-GET /metrics/prometheus
+```bash
+docker compose -f compose.production.yaml up --build
 ```
 
-## Why SQLite here?
-
-SQLite keeps the repository runnable with almost no infrastructure and is enough to demonstrate durable state, audit history and asynchronous processing locally.
-
-It is not presented as the final choice for a high-throughput distributed automation platform. A production design with multiple workers would normally move durable state to PostgreSQL or another production database and dispatch work through a broker or use database-level concurrent claiming semantics such as `SKIP LOCKED`.
+Swagger/OpenAPI is available at `http://127.0.0.1:8000/docs`.
 
 ## Engineering decisions
 
-See `docs/decisions/` for ADRs covering persistence, asynchronous execution, AI boundaries, external integration design, LLM guardrails, security and observability.
+See `docs/decisions/` for ADRs covering persistence, asynchronous execution, AI boundaries, integration design, LLM guardrails, security/observability and distributed state/dispatch.
 
 ## Roadmap
 
@@ -206,9 +214,10 @@ See `docs/decisions/` for ADRs covering persistence, asynchronous execution, AI 
 - [x] v0.5 - operational metrics, containerization and CI
 - [x] v0.6 - real HTTP integration layer for API and RPA execution paths
 - [x] v0.7 - guarded document/LLM enrichment with typed output, human review and evaluation harness
-- [x] v0.8 - API protection, correlation IDs, structured logging, Prometheus-style metrics and UiPath Orchestrator adapter
-- [ ] v0.9 - PostgreSQL/distributed worker strategy and broker-backed dispatch
+- [x] v0.8 - API protection, correlation IDs, structured logging, Prometheus-style metrics and UiPath adapter
+- [x] v0.9 - PostgreSQL-compatible state, Redis dispatch and multi-worker reference topology
+- [ ] v1.0 - cloud deployment, stronger identity/RBAC, distributed tracing and deployment pipeline
 
 ## Scope
 
-This is a portfolio/reference project, not a claim that this implementation should be dropped unchanged into production. Its purpose is to make design decisions explicit and to show how RPA, software, APIs and AI can coexist inside a broader automation architecture without pretending every component has the same reliability characteristics.
+This is a portfolio/reference project, not a claim that the implementation can be dropped unchanged into production. Its purpose is to make design decisions explicit and demonstrate how RPA, software, APIs, data infrastructure and AI can coexist inside a maintainable automation architecture.
