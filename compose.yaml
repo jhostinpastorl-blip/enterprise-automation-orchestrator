@@ -1,0 +1,27 @@
+services:
+  api:
+    build: .
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    environment:
+      AUTOMATION_DB_PATH: /data/automation.db
+      LOG_LEVEL: INFO
+    volumes:
+      - automation_data:/data
+    ports:
+      - "8000:8000"
+
+  worker:
+    build: .
+    command: python -m app.worker
+    environment:
+      AUTOMATION_DB_PATH: /data/automation.db
+      LOG_LEVEL: INFO
+      RETRY_DELAY_SECONDS: 5
+      WORKER_POLL_INTERVAL_SECONDS: 1
+    volumes:
+      - automation_data:/data
+    depends_on:
+      - api
+
+volumes:
+  automation_data:
