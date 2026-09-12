@@ -28,6 +28,11 @@ class SuccessfulAdapter:
         return f"completed {request.target}"
 
 
+class FailingAdapter:
+    def execute(self, request):
+        raise RuntimeError("temporary downstream failure")
+
+
 @pytest.fixture
 def repository(tmp_path, monkeypatch) -> AutomationRepository:
     monkeypatch.setenv("AUTOMATION_DB_PATH", str(tmp_path / "dispatch-test.db"))
@@ -95,4 +100,29 @@ def test_stale_broker_message_is_safely_ignored(repository: AutomationRepository
     dispatch.publish("missing-request")
     worker = AutomationWorker(repository=repository, dispatch=dispatch)
 
+    assert worker.run_once() is False
+
+
+def test_brokered_worker_recovers_retry_from_durable_state(
+    repository: AutomationRepository,
+    monkeypatch,
+) -> None:
+    dispatch = RedisDispatchQueue(client=FakeRedis(), queue_name="test-queue")
+    service = AutomationService(repository=repository, dispatch=dispatch)
+    result = service.submit(make_request())
+
+    monkeypatch.setitem(ADAPTERS, ExecutionChannel.API, FailingAdapter())
+    worker = AutomationWorker(repository=repository, dispatch=dispatch, retry_delay_seconds=0)
     assert worker.run_once() is True
+
+    retrying = repository.get(result.request_id)
+    assert retrying is not None
+    assert retrying.status.value == "retrying"
+
+    monkeypatch.setitem(ADAPTERS, ExecutionChannel.API, SuccessfulAdapter())
+    assert worker.run_once() is True
+
+    completed = repository.get(result.request_id)
+    assert completed is not None
+    assert completed.status.value == "completed"
+    assert completed.attempt_count == 2
