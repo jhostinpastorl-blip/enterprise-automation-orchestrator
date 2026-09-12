@@ -1,9 +1,12 @@
+from contextlib import asynccontextmanager
 import os
 
 from fastapi import FastAPI, HTTPException, status
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
+import redis
+from sqlalchemy import text
 
-from app.database import init_database
+from app.database import get_engine, init_database
 from app.enrichment import (
     DocumentEnrichmentRequest,
     DocumentEnrichmentResult,
@@ -17,27 +20,63 @@ from app.service import AutomationService
 
 configure_logging(os.getenv("LOG_LEVEL", "INFO"))
 
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    init_database()
+    yield
+
+
 app = FastAPI(
     title="Enterprise Automation Orchestrator",
-    version="0.9.0",
+    version="1.0.0",
     description=(
         "API-first orchestration service for durable enterprise automation workloads "
         "across API and RPA execution channels."
     ),
+    lifespan=lifespan,
 )
 app.add_middleware(ApiKeyMiddleware)
 app.add_middleware(CorrelationIdMiddleware)
 service = AutomationService()
 
 
-@app.on_event("startup")
-def startup() -> None:
-    init_database()
-
-
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/ready")
+def readiness():
+    dependencies: dict[str, str] = {}
+    ready = True
+
+    try:
+        with get_engine().connect() as connection:
+            connection.execute(text("SELECT 1"))
+        dependencies["database"] = "ok"
+    except Exception:
+        dependencies["database"] = "unavailable"
+        ready = False
+
+    if os.getenv("DISPATCH_BACKEND", "database").strip().lower() == "redis":
+        try:
+            client = redis.Redis.from_url(
+                os.getenv("REDIS_URL", "redis://localhost:6379/0"),
+                decode_responses=True,
+                socket_connect_timeout=1,
+                socket_timeout=1,
+            )
+            client.ping()
+            dependencies["redis"] = "ok"
+        except Exception:
+            dependencies["redis"] = "unavailable"
+            ready = False
+
+    payload = {"status": "ready" if ready else "not_ready", "dependencies": dependencies}
+    if not ready:
+        return JSONResponse(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, content=payload)
+    return payload
 
 
 @app.post(
