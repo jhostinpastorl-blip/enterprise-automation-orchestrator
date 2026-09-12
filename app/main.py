@@ -1,7 +1,7 @@
-import logging
 import os
 
 from fastapi import FastAPI, HTTPException, status
+from fastapi.responses import PlainTextResponse
 
 from app.database import init_database
 from app.enrichment import (
@@ -11,21 +11,22 @@ from app.enrichment import (
     LlmDocumentEnricher,
 )
 from app.models import AutomationRequest, AutomationRequestDetails, AutomationResult, MetricsSnapshot
+from app.observability import CorrelationIdMiddleware, configure_logging
+from app.security import ApiKeyMiddleware
 from app.service import AutomationService
 
-logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO"),
-    format="%(asctime)s %(levelname)s %(name)s %(message)s",
-)
+configure_logging(os.getenv("LOG_LEVEL", "INFO"))
 
 app = FastAPI(
     title="Enterprise Automation Orchestrator",
-    version="0.7.0",
+    version="0.8.0",
     description=(
         "API-first orchestration service for durable enterprise automation workloads "
         "across API and RPA execution channels."
     ),
 )
+app.add_middleware(ApiKeyMiddleware)
+app.add_middleware(CorrelationIdMiddleware)
 service = AutomationService()
 
 
@@ -78,3 +79,18 @@ def get_automation_request_audit(request_id: str) -> AutomationRequestDetails:
 @app.get("/metrics", response_model=MetricsSnapshot)
 def metrics() -> MetricsSnapshot:
     return service.metrics()
+
+
+@app.get("/metrics/prometheus", response_class=PlainTextResponse)
+def prometheus_metrics() -> str:
+    snapshot = service.metrics()
+    lines = [
+        "# HELP automation_requests_total Total automation requests accepted.",
+        "# TYPE automation_requests_total gauge",
+        f"automation_requests_total {snapshot.total_requests}",
+        "# HELP automation_requests_by_status Automation requests by current lifecycle status.",
+        "# TYPE automation_requests_by_status gauge",
+    ]
+    for request_status, count in sorted(snapshot.by_status.items()):
+        lines.append(f'automation_requests_by_status{{status="{request_status}"}} {count}')
+    return "\n".join(lines) + "\n"
