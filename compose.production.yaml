@@ -1,0 +1,79 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: automation
+      POSTGRES_USER: automation
+      POSTGRES_PASSWORD: automation
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U automation -d automation"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    volumes:
+      - redis_data:/data
+
+  api:
+    build: .
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    environment:
+      AUTOMATION_DATABASE_URL: postgresql+psycopg://automation:automation@postgres:5432/automation
+      DISPATCH_BACKEND: redis
+      REDIS_URL: redis://redis:6379/0
+      REDIS_QUEUE_NAME: automation:requests
+      LOG_LEVEL: INFO
+      ORCHESTRATOR_API_KEY: ${ORCHESTRATOR_API_KEY:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+
+  worker-a:
+    build: .
+    command: python -m app.worker
+    environment:
+      AUTOMATION_DATABASE_URL: postgresql+psycopg://automation:automation@postgres:5432/automation
+      DISPATCH_BACKEND: redis
+      REDIS_URL: redis://redis:6379/0
+      REDIS_QUEUE_NAME: automation:requests
+      LOG_LEVEL: INFO
+      RETRY_DELAY_SECONDS: 5
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker-b:
+    build: .
+    command: python -m app.worker
+    environment:
+      AUTOMATION_DATABASE_URL: postgresql+psycopg://automation:automation@postgres:5432/automation
+      DISPATCH_BACKEND: redis
+      REDIS_URL: redis://redis:6379/0
+      REDIS_QUEUE_NAME: automation:requests
+      LOG_LEVEL: INFO
+      RETRY_DELAY_SECONDS: 5
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+  redis_data:

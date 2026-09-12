@@ -15,6 +15,8 @@ class SuccessfulAdapter:
 def client(tmp_path, monkeypatch):
     db_path = tmp_path / "automation-test.db"
     monkeypatch.setenv("AUTOMATION_DB_PATH", str(db_path))
+    monkeypatch.delenv("AUTOMATION_DATABASE_URL", raising=False)
+    monkeypatch.setenv("DISPATCH_BACKEND", "database")
     monkeypatch.delenv("ORCHESTRATOR_API_KEY", raising=False)
     with TestClient(app) as test_client:
         yield test_client

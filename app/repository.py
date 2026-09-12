@@ -1,7 +1,10 @@
 import json
 from datetime import UTC, datetime, timedelta
 
-from app.database import transaction
+from sqlalchemy import and_, func, insert, or_, select, update
+from sqlalchemy.exc import IntegrityError
+
+from app.database import automation_events, automation_requests, transaction
 from app.models import (
     AutomationEvent,
     AutomationRequest,
@@ -20,94 +23,87 @@ def utc_now() -> str:
 class AutomationRepository:
     def create(self, request_id: str, request: AutomationRequest) -> str:
         now = utc_now()
-        with transaction() as connection:
-            if request.idempotency_key:
+        if request.idempotency_key:
+            with transaction() as connection:
                 existing = connection.execute(
-                    "SELECT request_id FROM automation_requests WHERE idempotency_key = ?",
-                    (request.idempotency_key,),
-                ).fetchone()
+                    select(automation_requests.c.request_id).where(
+                        automation_requests.c.idempotency_key == request.idempotency_key
+                    )
+                ).scalar_one_or_none()
                 if existing:
-                    return existing["request_id"]
+                    return str(existing)
 
-            connection.execute(
-                """
-                INSERT INTO automation_requests (
-                    request_id, idempotency_key, process, target, execution_channel,
-                    payload_json, status, detail, attempt_count, max_attempts,
-                    next_attempt_at, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
-                """,
-                (
+        try:
+            with transaction() as connection:
+                connection.execute(
+                    insert(automation_requests).values(
+                        request_id=request_id,
+                        idempotency_key=request.idempotency_key,
+                        process=request.process,
+                        target=request.target,
+                        execution_channel=request.execution_channel.value,
+                        payload_json=json.dumps(request.payload),
+                        status=AutomationStatus.QUEUED.value,
+                        detail="Request queued for processing",
+                        attempt_count=0,
+                        max_attempts=request.max_attempts,
+                        next_attempt_at=now,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+                self._append_event(
+                    connection,
                     request_id,
-                    request.idempotency_key,
-                    request.process,
-                    request.target,
-                    request.execution_channel.value,
-                    json.dumps(request.payload),
-                    AutomationStatus.QUEUED.value,
+                    AutomationStatus.QUEUED,
                     "Request queued for processing",
-                    request.max_attempts,
                     now,
-                    now,
-                    now,
-                ),
-            )
-            self._append_event(
-                connection,
-                request_id,
-                AutomationStatus.QUEUED,
-                "Request queued for processing",
-                now,
-            )
-        return request_id
+                )
+            return request_id
+        except IntegrityError:
+            if not request.idempotency_key:
+                raise
+            with transaction() as connection:
+                existing = connection.execute(
+                    select(automation_requests.c.request_id).where(
+                        automation_requests.c.idempotency_key == request.idempotency_key
+                    )
+                ).scalar_one_or_none()
+            if existing is None:
+                raise
+            return str(existing)
 
     def claim_next(self) -> tuple[str, AutomationRequest] | None:
         now = utc_now()
         with transaction(immediate=True) as connection:
-            row = connection.execute(
-                """
-                SELECT * FROM automation_requests
-                WHERE status IN (?, ?) AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
-                ORDER BY created_at
-                LIMIT 1
-                """,
-                (AutomationStatus.QUEUED.value, AutomationStatus.RETRYING.value, now),
-            ).fetchone()
+            statement = (
+                select(automation_requests)
+                .where(self._eligible_clause(now))
+                .order_by(automation_requests.c.created_at)
+                .limit(1)
+            )
+            if connection.dialect.name == "postgresql":
+                statement = statement.with_for_update(skip_locked=True)
+            row = connection.execute(statement).mappings().first()
             if row is None:
                 return None
+            return self._claim_row(connection, dict(row), now)
 
-            attempt_count = row["attempt_count"] + 1
-            connection.execute(
-                """
-                UPDATE automation_requests
-                SET status = ?, detail = ?, attempt_count = ?, updated_at = ?
-                WHERE request_id = ?
-                """,
-                (
-                    AutomationStatus.RUNNING.value,
-                    f"Execution attempt {attempt_count} started",
-                    attempt_count,
-                    now,
-                    row["request_id"],
-                ),
+    def claim(self, request_id: str) -> tuple[str, AutomationRequest] | None:
+        now = utc_now()
+        with transaction(immediate=True) as connection:
+            statement = select(automation_requests).where(
+                and_(
+                    automation_requests.c.request_id == request_id,
+                    self._eligible_clause(now),
+                )
             )
-            self._append_event(
-                connection,
-                row["request_id"],
-                AutomationStatus.RUNNING,
-                f"Execution attempt {attempt_count} started",
-                now,
-            )
-
-        request = AutomationRequest(
-            process=row["process"],
-            target=row["target"],
-            execution_channel=ExecutionChannel(row["execution_channel"]),
-            payload=json.loads(row["payload_json"]),
-            idempotency_key=row["idempotency_key"],
-            max_attempts=row["max_attempts"],
-        )
-        return row["request_id"], request
+            if connection.dialect.name == "postgresql":
+                statement = statement.with_for_update(skip_locked=True)
+            row = connection.execute(statement).mappings().first()
+            if row is None:
+                return None
+            return self._claim_row(connection, dict(row), now)
 
     def complete(self, request_id: str, detail: str) -> None:
         self.update_status(request_id, AutomationStatus.COMPLETED, detail)
@@ -115,9 +111,11 @@ class AutomationRepository:
     def fail_or_retry(self, request_id: str, detail: str, retry_delay_seconds: int) -> None:
         with transaction() as connection:
             row = connection.execute(
-                "SELECT attempt_count, max_attempts FROM automation_requests WHERE request_id = ?",
-                (request_id,),
-            ).fetchone()
+                select(
+                    automation_requests.c.attempt_count,
+                    automation_requests.c.max_attempts,
+                ).where(automation_requests.c.request_id == request_id)
+            ).mappings().first()
             if row is None:
                 raise KeyError(request_id)
 
@@ -131,12 +129,14 @@ class AutomationRepository:
                 else f"Retry scheduled after attempt {row['attempt_count']}: {detail}"
             )
             connection.execute(
-                """
-                UPDATE automation_requests
-                SET status = ?, detail = ?, next_attempt_at = ?, updated_at = ?
-                WHERE request_id = ?
-                """,
-                (status.value, message, next_attempt_at, now.isoformat(), request_id),
+                update(automation_requests)
+                .where(automation_requests.c.request_id == request_id)
+                .values(
+                    status=status.value,
+                    detail=message,
+                    next_attempt_at=next_attempt_at,
+                    updated_at=now.isoformat(),
+                )
             )
             self._append_event(connection, request_id, status, message, now.isoformat())
 
@@ -144,26 +144,32 @@ class AutomationRepository:
         now = utc_now()
         with transaction() as connection:
             connection.execute(
-                """
-                UPDATE automation_requests
-                SET status = ?, detail = ?, next_attempt_at = NULL, updated_at = ?
-                WHERE request_id = ?
-                """,
-                (status.value, detail, now, request_id),
+                update(automation_requests)
+                .where(automation_requests.c.request_id == request_id)
+                .values(
+                    status=status.value,
+                    detail=detail,
+                    next_attempt_at=None,
+                    updated_at=now,
+                )
             )
             self._append_event(connection, request_id, status, detail, now)
 
     def get(self, request_id: str) -> AutomationResult | None:
         with transaction() as connection:
             row = connection.execute(
-                """
-                SELECT request_id, status, execution_channel, detail,
-                       attempt_count, max_attempts, created_at, updated_at
-                FROM automation_requests WHERE request_id = ?
-                """,
-                (request_id,),
-            ).fetchone()
-        return self._to_result(row) if row else None
+                select(
+                    automation_requests.c.request_id,
+                    automation_requests.c.status,
+                    automation_requests.c.execution_channel,
+                    automation_requests.c.detail,
+                    automation_requests.c.attempt_count,
+                    automation_requests.c.max_attempts,
+                    automation_requests.c.created_at,
+                    automation_requests.c.updated_at,
+                ).where(automation_requests.c.request_id == request_id)
+            ).mappings().first()
+        return self._to_result(dict(row)) if row else None
 
     def get_details(self, request_id: str) -> AutomationRequestDetails | None:
         result = self.get(request_id)
@@ -171,12 +177,14 @@ class AutomationRepository:
             return None
         with transaction() as connection:
             rows = connection.execute(
-                """
-                SELECT status, detail, created_at
-                FROM automation_events WHERE request_id = ? ORDER BY event_id
-                """,
-                (request_id,),
-            ).fetchall()
+                select(
+                    automation_events.c.status,
+                    automation_events.c.detail,
+                    automation_events.c.created_at,
+                )
+                .where(automation_events.c.request_id == request_id)
+                .order_by(automation_events.c.event_id)
+            ).mappings().all()
         return AutomationRequestDetails(
             **result.model_dump(),
             events=[
@@ -191,24 +199,73 @@ class AutomationRepository:
 
     def metrics(self) -> MetricsSnapshot:
         with transaction() as connection:
-            total = connection.execute("SELECT COUNT(*) AS count FROM automation_requests").fetchone()["count"]
+            total = connection.execute(select(func.count()).select_from(automation_requests)).scalar_one()
             rows = connection.execute(
-                "SELECT status, COUNT(*) AS count FROM automation_requests GROUP BY status"
-            ).fetchall()
+                select(
+                    automation_requests.c.status,
+                    func.count().label("count"),
+                ).group_by(automation_requests.c.status)
+            ).mappings().all()
         return MetricsSnapshot(
-            total_requests=total,
-            by_status={row["status"]: row["count"] for row in rows},
+            total_requests=int(total),
+            by_status={str(row["status"]): int(row["count"]) for row in rows},
         )
+
+    @staticmethod
+    def _eligible_clause(now: str):
+        return and_(
+            automation_requests.c.status.in_(
+                [AutomationStatus.QUEUED.value, AutomationStatus.RETRYING.value]
+            ),
+            or_(
+                automation_requests.c.next_attempt_at.is_(None),
+                automation_requests.c.next_attempt_at <= now,
+            ),
+        )
+
+    def _claim_row(self, connection, row: dict, now: str) -> tuple[str, AutomationRequest]:
+        attempt_count = int(row["attempt_count"]) + 1
+        detail = f"Execution attempt {attempt_count} started"
+        connection.execute(
+            update(automation_requests)
+            .where(automation_requests.c.request_id == row["request_id"])
+            .values(
+                status=AutomationStatus.RUNNING.value,
+                detail=detail,
+                attempt_count=attempt_count,
+                updated_at=now,
+            )
+        )
+        self._append_event(
+            connection,
+            row["request_id"],
+            AutomationStatus.RUNNING,
+            detail,
+            now,
+        )
+        request = AutomationRequest(
+            process=row["process"],
+            target=row["target"],
+            execution_channel=ExecutionChannel(row["execution_channel"]),
+            payload=json.loads(row["payload_json"]),
+            idempotency_key=row["idempotency_key"],
+            max_attempts=row["max_attempts"],
+        )
+        return str(row["request_id"]), request
 
     @staticmethod
     def _append_event(connection, request_id: str, status: AutomationStatus, detail: str, created_at: str) -> None:
         connection.execute(
-            "INSERT INTO automation_events (request_id, status, detail, created_at) VALUES (?, ?, ?, ?)",
-            (request_id, status.value, detail, created_at),
+            insert(automation_events).values(
+                request_id=request_id,
+                status=status.value,
+                detail=detail,
+                created_at=created_at,
+            )
         )
 
     @staticmethod
-    def _to_result(row) -> AutomationResult:
+    def _to_result(row: dict) -> AutomationResult:
         return AutomationResult(
             request_id=row["request_id"],
             status=AutomationStatus(row["status"]),
