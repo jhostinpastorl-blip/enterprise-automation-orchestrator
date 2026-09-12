@@ -23,18 +23,24 @@ class AutomationWorker:
 
     def run_once(self) -> bool:
         dispatcher = self.dispatch or get_dispatch_queue()
+        claimed = None
+
         if dispatcher.brokered:
             request_id = dispatcher.consume(timeout_seconds=1)
-            if request_id is None:
-                return False
-            claimed = self.repository.claim(request_id)
+            if request_id is not None:
+                claimed = self.repository.claim(request_id)
+                if claimed is None:
+                    logger.info("stale_dispatch_message request_id=%s", request_id)
+
+            # Durable state remains authoritative. This fallback recovers work if a
+            # broker message is lost and also picks up retrying rows after their delay.
             if claimed is None:
-                logger.info("stale_dispatch_message request_id=%s", request_id)
-                return True
+                claimed = self.repository.claim_next()
         else:
             claimed = self.repository.claim_next()
-            if claimed is None:
-                return False
+
+        if claimed is None:
+            return False
 
         request_id, request = claimed
         adapter = ADAPTERS[request.execution_channel]
