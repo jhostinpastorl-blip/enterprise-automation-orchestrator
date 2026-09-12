@@ -18,7 +18,11 @@ class AutomationWorker:
         dispatch: DispatchQueue | None = None,
     ) -> None:
         self.repository = repository or AutomationRepository()
-        self.retry_delay_seconds = retry_delay_seconds or int(os.getenv("RETRY_DELAY_SECONDS", "5"))
+        self.retry_delay_seconds = (
+            int(os.getenv("RETRY_DELAY_SECONDS", "5"))
+            if retry_delay_seconds is None
+            else retry_delay_seconds
+        )
         self.dispatch = dispatch
 
     def run_once(self) -> bool:
