@@ -1,10 +1,14 @@
-import os
-
 import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app
-from app.worker import AutomationWorker
+from app.models import ExecutionChannel
+from app.worker import ADAPTERS, AutomationWorker
+
+
+class SuccessfulAdapter:
+    def execute(self, request):
+        return f"simulated completion for {request.target}"
 
 
 @pytest.fixture
@@ -21,7 +25,9 @@ def test_health(client: TestClient) -> None:
     assert response.json() == {"status": "ok"}
 
 
-def test_request_is_queued_then_completed_by_worker(client: TestClient) -> None:
+def test_request_is_queued_then_completed_by_worker(client: TestClient, monkeypatch) -> None:
+    monkeypatch.setitem(ADAPTERS, ExecutionChannel.API, SuccessfulAdapter())
+
     response = client.post(
         "/automation-requests",
         json={

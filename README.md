@@ -7,7 +7,8 @@ This repository is intentionally built around orchestration rather than a specif
 ## What it demonstrates
 
 - FastAPI contract with Pydantic validation
-- API/RPA adapters behind a common execution boundary
+- real HTTP API execution behind an adapter boundary
+- vendor-neutral HTTP submission to an external RPA platform/gateway
 - durable request state outside the robot workflow
 - asynchronous request acceptance and worker execution
 - idempotency keys for duplicate-submission protection
@@ -40,13 +41,39 @@ This repository is intentionally built around orchestration rather than a specif
                                                            |          |
                                                   API path |          | RPA path
                                                            v          v
-                                                   +-------+--+   +---+---------+
-                                                   | API      |   | RPA adapter |
-                                                   | adapter  |   | / platform  |
-                                                   +----------+   +-------------+
+                                                   +-------+--+   +---+----------------+
+                                                   | HTTP API |   | RPA platform /     |
+                                                   | adapter  |   | gateway adapter    |
+                                                   +----------+   +--------------------+
 ```
 
 The core decision is simple: use a stable API when one exists. Use RPA when the operation is only available through a user interface or a legacy application. The orchestration layer should not force every integration into a bot workflow.
+
+## Integration layer
+
+The worker no longer simulates API/RPA success. Both execution paths use real HTTP clients and fail explicitly when integration configuration is missing.
+
+For direct API execution:
+
+```text
+TARGET_API_BASE_URL=https://api.example.internal
+TARGET_API_TOKEN=...
+TARGET_API_TIMEOUT_SECONDS=10
+```
+
+`request.target` is appended to the configured base URL and the request payload is posted as JSON.
+
+For RPA execution:
+
+```text
+RPA_SUBMIT_URL=https://rpa-gateway.example.internal/jobs
+RPA_SUBMIT_TOKEN=...
+RPA_SUBMIT_TIMEOUT_SECONDS=10
+```
+
+The orchestrator submits a vendor-neutral job contract containing the process, target, payload and idempotency key. A production implementation can replace this HTTP gateway contract with a native UiPath or Automation Anywhere adapter without changing the orchestration lifecycle.
+
+This repository does **not** claim that a native vendor integration is already implemented.
 
 ## Request lifecycle
 
@@ -85,7 +112,7 @@ pip install -e .[dev]
 uvicorn app.main:app --reload
 ```
 
-Run the worker in another terminal:
+Run the worker in another terminal after configuring the integration variables you want to exercise:
 
 ```bash
 python -m app.worker
@@ -108,9 +135,9 @@ curl -X POST http://127.0.0.1:8000/automation-requests \
   -H "Content-Type: application/json" \
   -d '{
     "process":"customer_update",
-    "target":"crm",
+    "target":"crm/customers/C-10042",
     "execution_channel":"api",
-    "payload":{"customer_id":"C-10042"},
+    "payload":{"status":"active"},
     "idempotency_key":"customer-C-10042-update"
   }'
 ```
@@ -142,7 +169,7 @@ A sensible extension would place document classification or unstructured-field e
 
 ## Engineering decisions
 
-See `docs/decisions/` for short ADRs explaining the reasoning behind persistence and asynchronous execution.
+See `docs/decisions/` for short ADRs explaining persistence, asynchronous execution, AI boundaries and external integration design.
 
 ## Roadmap
 
@@ -151,7 +178,8 @@ See `docs/decisions/` for short ADRs explaining the reasoning behind persistence
 - [x] v0.3 - asynchronous request queue and worker
 - [x] v0.4 - retry policy, idempotency and dead-letter state
 - [x] v0.5 - operational metrics, containerization and CI
-- [ ] v0.6 - evaluated document/LLM enrichment with structured output and human review
+- [x] v0.6 - real HTTP integration layer for API and RPA execution paths
+- [ ] v0.7 - evaluated document/LLM enrichment with structured output and human review
 
 ## Scope
 
