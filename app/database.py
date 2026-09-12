@@ -64,8 +64,6 @@ def init_database() -> None:
 
             CREATE INDEX IF NOT EXISTS idx_automation_events_request_id
                 ON automation_events(request_id);
-            CREATE INDEX IF NOT EXISTS idx_automation_requests_status_next_attempt
-                ON automation_requests(status, next_attempt_at);
             """
         )
 
@@ -86,4 +84,8 @@ def init_database() -> None:
         connection.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_automation_requests_idempotency_key "
             "ON automation_requests(idempotency_key) WHERE idempotency_key IS NOT NULL"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_automation_requests_status_next_attempt "
+            "ON automation_requests(status, next_attempt_at)"
         )
