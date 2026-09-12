@@ -46,7 +46,7 @@ class AutomationEvent(BaseModel):
 
 
 class AutomationRequestDetails(AutomationResult):
-    events: list[AutomationEvent] = []
+    events: list[AutomationEvent] = Field(default_factory=list)
 
 
 class MetricsSnapshot(BaseModel):
