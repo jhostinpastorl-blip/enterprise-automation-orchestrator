@@ -1,20 +1,23 @@
 # Enterprise Automation Orchestrator
 
-A small reference implementation for a problem that appears often in enterprise automation: one business process may need direct APIs for some systems and RPA for others, while still requiring one place to track state, retries and audit history.
+A reference implementation for a problem that appears often in enterprise automation: one business process may need direct APIs for some systems and RPA for others, while still requiring one place to track state, retries, audit history and operational controls.
 
-This repository is intentionally built around orchestration rather than a specific RPA vendor.
+This repository is intentionally built around orchestration rather than forcing every integration into an RPA workflow.
 
 ## What it demonstrates
 
 - FastAPI contract with Pydantic validation
 - real HTTP API execution behind an adapter boundary
 - vendor-neutral HTTP submission to an external RPA platform/gateway
+- UiPath Orchestrator job submission through an OAuth/OData integration boundary
 - durable request state outside the robot workflow
 - asynchronous request acceptance and worker execution
 - idempotency keys for duplicate-submission protection
 - bounded retries and dead-letter state
 - append-only lifecycle audit events
-- basic operational metrics
+- correlation IDs and structured JSON logging
+- optional API-key protection for non-public endpoints
+- JSON and Prometheus-style operational metrics
 - optional LLM document enrichment with typed output and human-review guardrails
 - repeatable enrichment evaluation harness
 - Docker-based local API + worker setup
@@ -32,8 +35,8 @@ This repository is intentionally built around orchestration rather than a specif
                  document enrich    v
               +----------------+  +--------+---------+       +-------------------+
               | LLM boundary   |  |     FastAPI      | ----> | durable request   |
-              | + HITL flag    |  +------------------+       | state + queue     |
-              +----------------+                              +---------+---------+
+              | + HITL flag    |  | auth + tracing   |       | state + queue     |
+              +----------------+  +------------------+       +---------+---------+
                                                                       |
                                                                       | claim
                                                                       v
@@ -44,8 +47,8 @@ This repository is intentionally built around orchestration rather than a specif
                                                         API path |          | RPA path
                                                                  v          v
                                                          +-------+--+   +---+----------------+
-                                                         | HTTP API |   | RPA platform /     |
-                                                         | adapter  |   | gateway adapter    |
+                                                         | HTTP API |   | RPA gateway or    |
+                                                         | adapter  |   | UiPath Orchestrator|
                                                          +----------+   +--------------------+
 ```
 
@@ -53,9 +56,9 @@ The core decision is simple: use a stable API when one exists. Use RPA when the 
 
 ## Integration layer
 
-The worker does not simulate API/RPA success. Both execution paths use real HTTP clients and fail explicitly when integration configuration is missing.
+The worker does not simulate API/RPA success. Execution paths use real HTTP clients and fail explicitly when integration configuration is missing.
 
-For direct API execution:
+Direct API execution:
 
 ```text
 TARGET_API_BASE_URL=https://api.example.internal
@@ -63,17 +66,45 @@ TARGET_API_TOKEN=...
 TARGET_API_TIMEOUT_SECONDS=10
 ```
 
-For RPA execution:
+Vendor-neutral RPA gateway:
 
 ```text
+RPA_PROVIDER=gateway
 RPA_SUBMIT_URL=https://rpa-gateway.example.internal/jobs
 RPA_SUBMIT_TOKEN=...
 RPA_SUBMIT_TIMEOUT_SECONDS=10
 ```
 
-The RPA path submits a vendor-neutral job contract. A production implementation can replace this adapter with a native UiPath or Automation Anywhere client without changing the orchestration lifecycle.
+UiPath Orchestrator:
 
-This repository does **not** claim that a native vendor integration is already implemented.
+```text
+RPA_PROVIDER=uipath
+UIPATH_TOKEN_URL=https://cloud.uipath.com/identity_/connect/token
+UIPATH_ORCHESTRATOR_URL=https://cloud.uipath.com/<organization>/<tenant>/orchestrator_
+UIPATH_CLIENT_ID=...
+UIPATH_CLIENT_SECRET=...
+UIPATH_RELEASE_KEY=...
+UIPATH_FOLDER_ID=...
+```
+
+The UiPath adapter obtains a client-credentials access token and submits a job through the Orchestrator OData `StartJobs` surface. Configuration remains externalized so credentials are never committed to the repository.
+
+This is an implemented integration boundary with mocked contract tests; it is **not** presented as evidence of a live production UiPath tenant deployment from this repository.
+
+## Security and observability
+
+When `ORCHESTRATOR_API_KEY` is configured, non-public endpoints require an `X-API-Key` header. `/health` and API documentation remain public for local/reference use.
+
+Every HTTP request receives an `X-Correlation-ID`. A caller-provided ID is preserved; otherwise the service generates one. Logs are emitted as structured JSON and include that correlation ID so request-level troubleshooting can cross API and worker logs more easily.
+
+Operational metrics are exposed in two forms:
+
+```text
+GET /metrics
+GET /metrics/prometheus
+```
+
+The Prometheus-style endpoint currently exposes request counts and lifecycle status counts. It is intentionally small; a production deployment would normally add latency histograms, worker throughput, retry counts, dead-letter counts and external dependency metrics.
 
 ## Guarded document enrichment
 
@@ -153,17 +184,18 @@ POST /enrichment/documents
 GET /automation-requests/{request_id}
 GET /automation-requests/{request_id}/audit
 GET /metrics
+GET /metrics/prometheus
 ```
 
 ## Why SQLite here?
 
 SQLite keeps the repository runnable with almost no infrastructure and is enough to demonstrate durable state, audit history and asynchronous processing locally.
 
-It is not presented as the final choice for a high-throughput distributed automation platform. A production design with multiple workers would normally move durable state to a production database and dispatch work through a queue/broker with distributed consumption semantics.
+It is not presented as the final choice for a high-throughput distributed automation platform. A production design with multiple workers would normally move durable state to PostgreSQL or another production database and dispatch work through a broker or use database-level concurrent claiming semantics such as `SKIP LOCKED`.
 
 ## Engineering decisions
 
-See `docs/decisions/` for ADRs covering persistence, asynchronous execution, AI boundaries, external integration design and LLM guardrails.
+See `docs/decisions/` for ADRs covering persistence, asynchronous execution, AI boundaries, external integration design, LLM guardrails, security and observability.
 
 ## Roadmap
 
@@ -174,7 +206,8 @@ See `docs/decisions/` for ADRs covering persistence, asynchronous execution, AI 
 - [x] v0.5 - operational metrics, containerization and CI
 - [x] v0.6 - real HTTP integration layer for API and RPA execution paths
 - [x] v0.7 - guarded document/LLM enrichment with typed output, human review and evaluation harness
-- [ ] v0.8 - production database/queue adapter and distributed worker strategy
+- [x] v0.8 - API protection, correlation IDs, structured logging, Prometheus-style metrics and UiPath Orchestrator adapter
+- [ ] v0.9 - PostgreSQL/distributed worker strategy and broker-backed dispatch
 
 ## Scope
 
