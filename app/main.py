@@ -19,7 +19,7 @@ configure_logging(os.getenv("LOG_LEVEL", "INFO"))
 
 app = FastAPI(
     title="Enterprise Automation Orchestrator",
-    version="0.8.0",
+    version="0.9.0",
     description=(
         "API-first orchestration service for durable enterprise automation workloads "
         "across API and RPA execution channels."
