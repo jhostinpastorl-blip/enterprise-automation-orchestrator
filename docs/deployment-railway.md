@@ -1,17 +1,23 @@
 # Railway deployment topology
 
-This repository can be deployed as separate API and worker services backed by managed PostgreSQL and Redis. The deployment keeps the same boundaries used by the local distributed topology.
+This reference implementation is deployed on Railway as separate API and worker services backed by PostgreSQL and Redis.
 
-## Services
+## Verified deployment
 
-Create four Railway resources in one project:
+Public API:
 
-1. PostgreSQL database
-2. Redis database
-3. API service from this GitHub repository
-4. Worker service from this GitHub repository
+```text
+https://api-production-f93c7.up.railway.app
+```
 
-The API and worker use the same image and environment configuration but different start commands.
+Verified Railway services:
+
+1. `api` — FastAPI service from this GitHub repository
+2. `worker` — asynchronous worker from the same repository
+3. `postgres` — PostgreSQL 16
+4. `redis` — Redis 7
+
+The deployed API, worker, PostgreSQL and Redis services have all reached Railway `SUCCESS` state. Railway health validation has confirmed `GET /health` returns HTTP 200. A dependency-aware `/ready` healthcheck also completed successfully during deployment validation with PostgreSQL and Redis configured.
 
 ## API service
 
@@ -20,52 +26,43 @@ Build from the repository Dockerfile.
 Start command:
 
 ```text
-uvicorn app.main:app --host 0.0.0.0 --port $PORT
+sh -c 'python -m uvicorn app.main:app --host 0.0.0.0 --port "${PORT:-8000}"'
 ```
 
-Required runtime variables:
+Runtime variables:
 
 ```text
 AUTOMATION_DATABASE_URL=<Railway PostgreSQL SQLAlchemy URL>
 DISPATCH_BACKEND=redis
-REDIS_URL=<Railway Redis URL>
+REDIS_URL=<Railway Redis private URL>
 REDIS_QUEUE_NAME=automation:requests
 LOG_LEVEL=INFO
-ORCHESTRATOR_API_KEY=<generated secret>
+PORT=8000
 ```
 
-Health endpoint:
+Liveness endpoint:
 
 ```text
-/health
+GET /health
 ```
 
-Readiness endpoint:
+Dependency-aware readiness endpoint:
 
 ```text
-/ready
+GET /ready
 ```
 
-`/ready` checks the configured database and, when Redis dispatch is enabled, Redis connectivity.
+`/ready` executes a database connectivity check and pings Redis when broker-backed dispatch is enabled.
 
 ## Worker service
 
-Build from the same repository Dockerfile.
-
-Start command:
+The worker uses the same application source and PostgreSQL/Redis configuration. The deployment initializes the reference schema before starting the worker:
 
 ```text
-python -m app.worker
+python -c "from app.database import init_database; init_database()" && python -m app.worker
 ```
 
-Use the same PostgreSQL and Redis variables as the API. Add:
-
-```text
-RETRY_DELAY_SECONDS=5
-WORKER_POLL_INTERVAL_SECONDS=1
-```
-
-Scale worker replicas only after validating downstream system idempotency and concurrency behavior.
+This keeps PostgreSQL authoritative for lifecycle state and audit history while Redis carries request IDs for dispatch.
 
 ## External integrations
 
@@ -85,20 +82,21 @@ RPA_SUBMIT_URL=
 RPA_SUBMIT_TOKEN=
 ```
 
-The UiPath path requires the documented `UIPATH_*` variables. Secrets must be configured through the platform secret store and never committed to Git.
+The UiPath path requires the documented `UIPATH_*` variables. The current portfolio deployment does not claim live production UiPath credentials.
 
-## Deployment validation
+## Validation completed
 
-After deployment:
-
-1. Verify `GET /health` returns HTTP 200.
-2. Verify `GET /ready` reports PostgreSQL and Redis as `ok`.
-3. Submit one request with a unique `idempotency_key`.
-4. Confirm a worker moves it from `queued` to `running` and then to its terminal state.
-5. Re-submit the same idempotency key and confirm the existing request is returned.
-6. Review structured logs using the returned `X-Correlation-ID`.
-7. Check `/metrics/prometheus` for lifecycle counts.
+- GitHub Actions unit/quality tests: passed
+- GitHub Actions PostgreSQL + Redis distributed integration test: passed
+- GitHub Actions container build: passed
+- Railway PostgreSQL service: `SUCCESS`
+- Railway Redis service: `SUCCESS`
+- Railway worker service: `SUCCESS`
+- Railway API service: `SUCCESS`
+- Railway `/health`: HTTP 200 during deployment healthcheck
+- Railway dependency-aware `/ready`: successfully passed during deployment validation
+- Public Railway domain generated and attached to the API service
 
 ## Scope
 
-A live Railway deployment would demonstrate deployment and operations of this reference implementation. It would not by itself prove enterprise production scale, availability targets, security certification, or live UiPath production integration. Those claims require separate evidence.
+This deployment demonstrates that the reference architecture can be built and operated on an external managed cloud platform with separate API, worker, PostgreSQL and Redis services. It does **not** by itself prove enterprise production scale, load-tested availability, security certification, live production UiPath integration, enterprise OAuth/OIDC/RBAC, or production AI model performance. Those claims require separate evidence.
