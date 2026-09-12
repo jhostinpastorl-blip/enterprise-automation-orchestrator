@@ -27,3 +27,5 @@ class AutomationResult(BaseModel):
     status: AutomationStatus
     execution_channel: ExecutionChannel
     detail: str
+    created_at: str
+    updated_at: str
