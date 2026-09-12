@@ -18,11 +18,13 @@ The design treats RPA as one execution mechanism inside a broader automation sys
 - idempotency, bounded retries and dead-letter state
 - append-only lifecycle audit events
 - API-key protection, correlation IDs and structured JSON logging
+- liveness and dependency-aware readiness probes
 - JSON and Prometheus-style operational metrics
 - optional LLM document enrichment with typed output and human-review guardrails
 - repeatable LLM evaluation harness
 - Docker Compose topologies for local and distributed execution
-- automated tests in GitHub Actions
+- unit tests plus PostgreSQL/Redis distributed integration tests in GitHub Actions
+- automated lint and container-build validation in CI
 - ADRs documenting technical decisions and trade-offs
 
 ## Architecture
@@ -157,12 +159,16 @@ Clients can provide an `idempotency_key`; repeated submissions return the existi
 
 When `ORCHESTRATOR_API_KEY` is configured, non-public endpoints require `X-API-Key`. Every HTTP request receives an `X-Correlation-ID`, and logs are emitted as structured JSON with that identifier.
 
-Operational metrics:
+Operational endpoints:
 
 ```text
+GET /health
+GET /ready
 GET /metrics
 GET /metrics/prometheus
 ```
+
+`/health` confirms the API process is alive. `/ready` checks database connectivity and Redis when broker-backed dispatch is enabled, so a deployment can distinguish process liveness from dependency readiness.
 
 The current Prometheus-style metrics intentionally remain small. A real production deployment would normally add latency histograms, dependency timing, worker throughput, retry/dead-letter counters and distributed tracing.
 
@@ -201,6 +207,20 @@ docker compose -f compose.production.yaml up --build
 
 Swagger/OpenAPI is available at `http://127.0.0.1:8000/docs`.
 
+## CI validation
+
+The CI pipeline separates three concerns:
+
+- code quality and SQLite unit tests
+- a distributed integration test against real PostgreSQL and Redis service containers
+- a clean Docker image build
+
+The distributed test persists a request in PostgreSQL, publishes its ID to Redis, consumes it with the worker, atomically claims it and verifies the final lifecycle and audit history. This validates the distributed path without claiming external managed-cloud scale or live RPA credentials.
+
+## Deployment
+
+`docs/deployment-railway.md` documents an API + worker + PostgreSQL + Redis cloud topology and the validation steps expected after deployment. A public cloud URL is intentionally not claimed until a real external deployment is connected and verified.
+
 ## Engineering decisions
 
 See `docs/decisions/` for ADRs covering persistence, asynchronous execution, AI boundaries, integration design, LLM guardrails, security/observability and distributed state/dispatch.
@@ -216,7 +236,10 @@ See `docs/decisions/` for ADRs covering persistence, asynchronous execution, AI 
 - [x] v0.7 - guarded document/LLM enrichment with typed output, human review and evaluation harness
 - [x] v0.8 - API protection, correlation IDs, structured logging, Prometheus-style metrics and UiPath adapter
 - [x] v0.9 - PostgreSQL-compatible state, Redis dispatch and multi-worker reference topology
-- [ ] v1.0 - cloud deployment, stronger identity/RBAC, distributed tracing and deployment pipeline
+- [x] v1.0 - distributed CI validation, readiness probes, linting and container-build quality gates
+- [ ] cloud deployment - deploy the API/worker topology to an external provider and verify it through a public or protected URL
+- [ ] enterprise identity - replace reference API-key protection with OAuth/OIDC and RBAC where the deployment context requires it
+- [ ] distributed tracing - add OpenTelemetry only when a multi-service deployment provides a real trace backend
 
 ## Scope
 
