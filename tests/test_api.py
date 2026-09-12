@@ -15,6 +15,7 @@ class SuccessfulAdapter:
 def client(tmp_path, monkeypatch):
     db_path = tmp_path / "automation-test.db"
     monkeypatch.setenv("AUTOMATION_DB_PATH", str(db_path))
+    monkeypatch.delenv("ORCHESTRATOR_API_KEY", raising=False)
     with TestClient(app) as test_client:
         yield test_client
 
@@ -23,6 +24,24 @@ def test_health(client: TestClient) -> None:
     response = client.get("/health")
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
+    assert response.headers["X-Correlation-ID"]
+
+
+def test_preserves_client_correlation_id(client: TestClient) -> None:
+    response = client.get("/health", headers={"X-Correlation-ID": "trace-123"})
+    assert response.headers["X-Correlation-ID"] == "trace-123"
+
+
+def test_api_key_protects_non_public_endpoints(client: TestClient, monkeypatch) -> None:
+    monkeypatch.setenv("ORCHESTRATOR_API_KEY", "secret-key")
+
+    unauthorized = client.get("/metrics")
+    authorized = client.get("/metrics", headers={"X-API-Key": "secret-key"})
+    health = client.get("/health")
+
+    assert unauthorized.status_code == 401
+    assert authorized.status_code == 200
+    assert health.status_code == 200
 
 
 def test_request_is_queued_then_completed_by_worker(client: TestClient, monkeypatch) -> None:
@@ -87,6 +106,22 @@ def test_metrics_reports_status_counts(client: TestClient) -> None:
     assert response.status_code == 200
     assert response.json()["total_requests"] == 1
     assert response.json()["by_status"]["queued"] == 1
+
+
+def test_prometheus_metrics_endpoint(client: TestClient) -> None:
+    client.post(
+        "/automation-requests",
+        json={
+            "process": "sync",
+            "target": "crm",
+            "execution_channel": "api",
+            "payload": {},
+        },
+    )
+    response = client.get("/metrics/prometheus")
+    assert response.status_code == 200
+    assert "automation_requests_total 1" in response.text
+    assert 'automation_requests_by_status{status="queued"} 1' in response.text
 
 
 def test_returns_404_for_unknown_request(client: TestClient) -> None:
