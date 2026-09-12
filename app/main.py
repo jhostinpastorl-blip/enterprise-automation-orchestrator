@@ -1,9 +1,9 @@
-from contextlib import asynccontextmanager
 import os
+from contextlib import asynccontextmanager
 
+import redis
 from fastapi import FastAPI, HTTPException, status
 from fastapi.responses import JSONResponse, PlainTextResponse
-import redis
 from sqlalchemy import text
 
 from app.database import get_engine, init_database
