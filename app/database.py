@@ -19,9 +19,11 @@ def connect() -> sqlite3.Connection:
 
 
 @contextmanager
-def transaction() -> Iterator[sqlite3.Connection]:
+def transaction(*, immediate: bool = False) -> Iterator[sqlite3.Connection]:
     connection = connect()
     try:
+        if immediate:
+            connection.execute("BEGIN IMMEDIATE")
         yield connection
         connection.commit()
     except Exception:
