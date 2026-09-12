@@ -6,13 +6,15 @@ The project focuses on a common integration problem: some target systems expose 
 
 ## Current scope
 
-The first iteration provides:
+Version 0.2 provides:
 
-- a small FastAPI service for receiving automation requests;
+- a FastAPI service for receiving automation requests;
 - typed request validation with Pydantic;
 - a service layer that owns routing decisions;
 - separate API and RPA adapters behind a common interface;
-- explicit request states that can later be persisted and processed asynchronously.
+- SQLite persistence for request state;
+- an append-only audit event table for lifecycle changes;
+- request lookup by ID for operational traceability.
 
 ## Architecture
 
@@ -23,7 +25,9 @@ Client
 FastAPI endpoint
   |
   v
-Automation service
+Automation service ---------> SQLite request state
+  |                               |
+  |                               +--> audit events
   |
   +--> API adapter ----> target system API
   |
@@ -32,11 +36,13 @@ Automation service
 
 The rule is intentionally simple: use an API when a reliable one is available; use RPA when the business operation depends on a UI-only system. This keeps RPA as one execution channel rather than making the workflow itself dependent on a specific automation platform.
 
-## Why this project exists
+## Persistence and audit trail
 
-Enterprise automation often becomes difficult to maintain when validation, orchestration, integration logic and UI automation are all placed inside the same bot workflow. This project explores a cleaner boundary between those concerns.
+Each request is persisted before execution with an `accepted` status. The final state is then written as either `completed` or `failed`.
 
-The next iterations will add persistence, queue-based processing, idempotency, retry policies, structured logging and operational visibility before introducing any AI capability.
+The current state lives in `automation_requests`, while every lifecycle transition is also appended to `automation_events`. Keeping current state and history separate makes operational queries simple without losing the execution trail.
+
+SQLite is deliberate at this stage: it keeps local development lightweight while the repository boundary leaves room to move to PostgreSQL in a later iteration without pushing database logic into the API layer.
 
 ## Run locally
 
@@ -48,6 +54,12 @@ uvicorn app.main:app --reload
 ```
 
 Open `http://127.0.0.1:8000/docs` for the generated API documentation.
+
+The database defaults to `automation.db`. To use another path:
+
+```bash
+export AUTOMATION_DB_PATH=/tmp/automation.db
+```
 
 ## Example request
 
@@ -63,15 +75,38 @@ Open `http://127.0.0.1:8000/docs` for the generated API documentation.
 }
 ```
 
+Create a request:
+
+```bash
+curl -X POST http://127.0.0.1:8000/automation-requests \
+  -H "Content-Type: application/json" \
+  -d '{"process":"customer_update","target":"crm","execution_channel":"api","payload":{"customer_id":"C-10042"}}'
+```
+
+Retrieve its persisted state:
+
+```bash
+curl http://127.0.0.1:8000/automation-requests/<request_id>
+```
+
+## Design principles
+
+- Prefer direct API integration when a stable contract exists.
+- Isolate RPA behind an adapter when UI automation is unavoidable.
+- Persist request state outside the bot workflow.
+- Keep an audit trail of state transitions.
+- Add asynchronous processing before increasing execution complexity.
+- Introduce AI only where it solves an uncertain or unstructured task better than deterministic logic.
+
 ## Roadmap
 
-- v0.1 - API contract and routing boundary
-- v0.2 - persistence and audit trail
-- v0.3 - asynchronous queue and worker
-- v0.4 - retry, idempotency and dead-letter handling
-- v0.5 - observability and operational metrics
-- v0.6 - optional document/LLM enrichment where it provides a clear business benefit
+- [x] v0.1 - API contract and routing boundary
+- [x] v0.2 - persistence and audit trail
+- [ ] v0.3 - asynchronous queue and worker
+- [ ] v0.4 - retry, idempotency and dead-letter handling
+- [ ] v0.5 - observability and operational metrics
+- [ ] v0.6 - optional document/LLM enrichment where it provides a clear business benefit
 
 ## Status
 
-Early-stage portfolio project. The goal is to evolve it incrementally and document the design decisions as the architecture grows.
+This is an evolving portfolio project focused on design decisions found in real enterprise automation environments. Features are introduced incrementally so each architectural change has a clear reason and trade-off.
