@@ -3,6 +3,8 @@ import os
 import time
 
 from app.adapters import ADAPTERS
+from app.dispatch import DispatchQueue, get_dispatch_queue
+from app.observability import configure_logging
 from app.repository import AutomationRepository
 
 logger = logging.getLogger(__name__)
@@ -13,14 +15,26 @@ class AutomationWorker:
         self,
         repository: AutomationRepository | None = None,
         retry_delay_seconds: int | None = None,
+        dispatch: DispatchQueue | None = None,
     ) -> None:
         self.repository = repository or AutomationRepository()
         self.retry_delay_seconds = retry_delay_seconds or int(os.getenv("RETRY_DELAY_SECONDS", "5"))
+        self.dispatch = dispatch
 
     def run_once(self) -> bool:
-        claimed = self.repository.claim_next()
-        if claimed is None:
-            return False
+        dispatcher = self.dispatch or get_dispatch_queue()
+        if dispatcher.brokered:
+            request_id = dispatcher.consume(timeout_seconds=1)
+            if request_id is None:
+                return False
+            claimed = self.repository.claim(request_id)
+            if claimed is None:
+                logger.info("stale_dispatch_message request_id=%s", request_id)
+                return True
+        else:
+            claimed = self.repository.claim_next()
+            if claimed is None:
+                return False
 
         request_id, request = claimed
         adapter = ADAPTERS[request.execution_channel]
@@ -56,10 +70,7 @@ class AutomationWorker:
 
 
 def main() -> None:
-    logging.basicConfig(
-        level=os.getenv("LOG_LEVEL", "INFO"),
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
-    )
+    configure_logging(os.getenv("LOG_LEVEL", "INFO"))
     AutomationWorker().run_forever(
         poll_interval_seconds=float(os.getenv("WORKER_POLL_INTERVAL_SECONDS", "1"))
     )
