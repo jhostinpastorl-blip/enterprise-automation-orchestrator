@@ -63,7 +63,7 @@ class AutomationRepository:
 
     def claim_next(self) -> tuple[str, AutomationRequest] | None:
         now = utc_now()
-        with transaction() as connection:
+        with transaction(immediate=True) as connection:
             row = connection.execute(
                 """
                 SELECT * FROM automation_requests
