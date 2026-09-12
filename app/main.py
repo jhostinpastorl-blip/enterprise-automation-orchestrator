@@ -4,6 +4,12 @@ import os
 from fastapi import FastAPI, HTTPException, status
 
 from app.database import init_database
+from app.enrichment import (
+    DocumentEnrichmentRequest,
+    DocumentEnrichmentResult,
+    EnrichmentError,
+    LlmDocumentEnricher,
+)
 from app.models import AutomationRequest, AutomationRequestDetails, AutomationResult, MetricsSnapshot
 from app.service import AutomationService
 
@@ -14,7 +20,7 @@ logging.basicConfig(
 
 app = FastAPI(
     title="Enterprise Automation Orchestrator",
-    version="0.5.0",
+    version="0.7.0",
     description=(
         "API-first orchestration service for durable enterprise automation workloads "
         "across API and RPA execution channels."
@@ -40,6 +46,17 @@ def health() -> dict[str, str]:
 )
 def create_automation_request(request: AutomationRequest) -> AutomationResult:
     return service.submit(request)
+
+
+@app.post("/enrichment/documents", response_model=DocumentEnrichmentResult)
+def enrich_document(request: DocumentEnrichmentRequest) -> DocumentEnrichmentResult:
+    try:
+        return LlmDocumentEnricher().enrich(request)
+    except EnrichmentError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(exc),
+        ) from exc
 
 
 @app.get("/automation-requests/{request_id}", response_model=AutomationResult)
