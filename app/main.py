@@ -14,7 +14,7 @@ from app.enrichment import (
     LlmDocumentEnricher,
 )
 from app.models import AutomationRequest, AutomationRequestDetails, AutomationResult, MetricsSnapshot
-from app.observability import CorrelationIdMiddleware, configure_logging
+from app.observability import CorrelationIdMiddleware, configure_logging, render_http_metrics
 from app.security import ApiKeyMiddleware
 from app.service import AutomationService
 
@@ -29,7 +29,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Enterprise Automation Orchestrator",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "API-first orchestration service for durable enterprise automation workloads "
         "across API and RPA execution channels."
@@ -50,7 +50,6 @@ def health() -> dict[str, str]:
 def readiness():
     dependencies: dict[str, str] = {}
     ready = True
-
     try:
         with get_engine().connect() as connection:
             connection.execute(text("SELECT 1"))
@@ -58,7 +57,6 @@ def readiness():
     except Exception:
         dependencies["database"] = "unavailable"
         ready = False
-
     if os.getenv("DISPATCH_BACKEND", "database").strip().lower() == "redis":
         try:
             client = redis.Redis.from_url(
@@ -72,18 +70,13 @@ def readiness():
         except Exception:
             dependencies["redis"] = "unavailable"
             ready = False
-
     payload = {"status": "ready" if ready else "not_ready", "dependencies": dependencies}
     if not ready:
         return JSONResponse(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, content=payload)
     return payload
 
 
-@app.post(
-    "/automation-requests",
-    response_model=AutomationResult,
-    status_code=status.HTTP_202_ACCEPTED,
-)
+@app.post("/automation-requests", response_model=AutomationResult, status_code=status.HTTP_202_ACCEPTED)
 def create_automation_request(request: AutomationRequest) -> AutomationResult:
     return service.submit(request)
 
@@ -93,10 +86,7 @@ def enrich_document(request: DocumentEnrichmentRequest) -> DocumentEnrichmentRes
     try:
         return LlmDocumentEnricher().enrich(request)
     except EnrichmentError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=str(exc),
-        ) from exc
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
 
 
 @app.get("/automation-requests/{request_id}", response_model=AutomationResult)
@@ -132,4 +122,4 @@ def prometheus_metrics() -> str:
     ]
     for request_status, count in sorted(snapshot.by_status.items()):
         lines.append(f'automation_requests_by_status{{status="{request_status}"}} {count}')
-    return "\n".join(lines) + "\n"
+    return "\n".join(lines) + "\n" + render_http_metrics()
