@@ -2,80 +2,55 @@
 
 A reference implementation for enterprise automation where one business process may require direct APIs, RPA and optional AI enrichment while still needing durable state, retries, auditability, security controls and observable execution.
 
-The design treats RPA as one execution mechanism inside a broader automation system rather than making the robot workflow the system of record.
+The core design decision is simple: **RPA is an execution mechanism, not the system of record.** Business orchestration, lifecycle state and reliability controls stay outside the robot workflow.
 
-## Live deployment
+## Live reference deployment
 
 **API:** https://api-production-f93c7.up.railway.app
 
-The reference topology is deployed on Railway with separate **FastAPI API, worker, PostgreSQL and Redis services**. All four services have reached Railway `SUCCESS` state. Railway deployment validation confirmed the API liveness endpoint with HTTP 200, and dependency-aware readiness was also exercised with PostgreSQL and Redis configured.
+Railway runs separate **FastAPI API, worker, PostgreSQL and Redis services**. The API exposes liveness and dependency-aware readiness probes; `/ready` verifies database connectivity and Redis when broker-backed dispatch is enabled. Non-public API endpoints can be protected with `X-API-Key` through `ORCHESTRATOR_API_KEY`.
 
-This is a portfolio/reference cloud deployment. It is not presented as evidence of enterprise production scale, load-tested availability, security certification or live production UiPath credentials.
+This is intentionally described as a **portfolio/reference cloud deployment**. It is not evidence of enterprise production scale, security certification, load-tested availability or live production UiPath credentials. The current Railway PostgreSQL container does not have a persistent Railway volume attached, so the cloud environment must not be represented as production-grade durable storage.
 
 ## What it demonstrates
 
-- FastAPI + Pydantic API contract
+- FastAPI + Pydantic API contracts
 - direct HTTP integrations behind adapter boundaries
 - vendor-neutral RPA gateway integration
 - UiPath Orchestrator OAuth/OData job-submission boundary
-- SQLite for low-friction local development
-- PostgreSQL durable state through SQLAlchemy
-- atomic PostgreSQL worker claiming with `FOR UPDATE SKIP LOCKED`
-- Redis-backed work dispatch
-- asynchronous workers sharing one durable state store
-- idempotency, bounded retries and dead-letter state
+- SQLAlchemy persistence with SQLite local mode and PostgreSQL distributed mode
+- PostgreSQL worker claiming with `FOR UPDATE SKIP LOCKED`
+- Redis-backed dispatch with PostgreSQL remaining authoritative
+- asynchronous workers, idempotency, bounded retries and dead-letter state
 - append-only lifecycle audit events
+- Alembic schema migrations
 - API-key protection, correlation IDs and structured JSON logging
 - liveness and dependency-aware readiness probes
-- JSON and Prometheus-style operational metrics
-- optional LLM document enrichment with typed output and human-review guardrails
-- repeatable LLM evaluation harness
-- Docker topologies for local/distributed execution
-- unit tests plus PostgreSQL/Redis distributed integration tests in GitHub Actions
-- automated lint and container-build validation in CI
-- external Railway deployment
-- ADRs documenting technical decisions and trade-offs
+- operational HTTP latency/request metrics plus Prometheus-style automation metrics
+- guarded LLM document enrichment with typed output and human-review controls
+- repeatable synthetic evaluation harness
+- Docker topologies, Ruff, unit tests and GitHub Actions CI
+- distributed integration tests against real PostgreSQL and Redis service containers
+- container-build validation and Railway deployment
+- ADRs documenting design decisions and trade-offs
 
 ## Architecture
 
 ```text
-                         +----------------------+
-                         |      API client      |
-                         +----------+-----------+
-                                    |
-                                    v
-                         +----------+-----------+
-                         |       FastAPI        |
-                         | auth + correlation   |
-                         +----------+-----------+
-                                    |
-                         persist    |    publish request ID
-                                    v
-                         +----------+-----------+
-                         |      PostgreSQL      |
-                         | state + audit trail  |
-                         +----------+-----------+
-                                    |
-                                    +--------------------+
-                                                         |
-                                                +--------v--------+
-                                                |      Redis      |
-                                                |    dispatch     |
-                                                +--------+--------+
-                                                         |
-                                              +----------+----------+
-                                              |                     |
-                                              v                     v
-                                      +-------+-------+     +-------+-------+
-                                      |    worker     |     | worker/scale  |
-                                      +---+-------+---+     +---+-------+---+
-                                          |       |             |       |
-                                     API  |       | RPA    API |       | RPA
-                                          v       v             v       v
-                                      HTTP APIs  UiPath/RPA  HTTP APIs  UiPath/RPA
+Client
+  |
+  v
+FastAPI ---------------> PostgreSQL
+  |                    state + audit
+  | publish request ID       ^
+  v                          |
+Redis -----------------> Worker
+                          |   |
+                          |   +--> RPA / UiPath boundary
+                          +------> Direct HTTP API
 ```
 
-PostgreSQL remains authoritative. Redis carries request IDs for dispatch only; a worker must atomically claim the persisted request before execution. Duplicate or stale broker messages therefore cannot by themselves create a second execution claim.
+PostgreSQL is the authoritative state store. Redis carries request IDs for dispatch only. A worker must atomically claim persisted work before execution, so stale or duplicate broker messages do not by themselves create a second execution claim.
 
 ## Operating modes
 
@@ -86,8 +61,6 @@ AUTOMATION_DB_PATH=automation.db
 DISPATCH_BACKEND=database
 ```
 
-Workers poll durable SQLite state directly. This keeps local setup intentionally small.
-
 ### Distributed
 
 ```text
@@ -97,47 +70,11 @@ REDIS_URL=redis://...
 REDIS_QUEUE_NAME=automation:requests
 ```
 
-PostgreSQL uses row locking with `FOR UPDATE SKIP LOCKED` when workers compete for eligible work. Redis provides dispatch while PostgreSQL owns lifecycle state, attempts, idempotency and audit history.
-
-Run the local distributed topology:
+Run the distributed reference topology locally:
 
 ```bash
 docker compose -f compose.production.yaml up --build
 ```
-
-## Integration layer
-
-The worker uses explicit adapter boundaries for external execution.
-
-**Direct API execution**
-
-```text
-TARGET_API_BASE_URL=https://api.example.internal
-TARGET_API_TOKEN=...
-TARGET_API_TIMEOUT_SECONDS=10
-```
-
-**Vendor-neutral RPA gateway**
-
-```text
-RPA_PROVIDER=gateway
-RPA_SUBMIT_URL=https://rpa-gateway.example.internal/jobs
-RPA_SUBMIT_TOKEN=...
-```
-
-**UiPath Orchestrator**
-
-```text
-RPA_PROVIDER=uipath
-UIPATH_TOKEN_URL=https://cloud.uipath.com/identity_/connect/token
-UIPATH_ORCHESTRATOR_URL=https://cloud.uipath.com/<organization>/<tenant>/orchestrator_
-UIPATH_CLIENT_ID=...
-UIPATH_CLIENT_SECRET=...
-UIPATH_RELEASE_KEY=...
-UIPATH_FOLDER_ID=...
-```
-
-The UiPath adapter obtains a client-credentials token and submits a job through the Orchestrator OData `StartJobs` surface. It is contract-tested with mocked HTTP responses; the repository does not claim a live production UiPath tenant integration.
 
 ## Reliability model
 
@@ -147,11 +84,21 @@ queued -> running -> retrying -> running -> completed
 queued -> running -> retrying -> ... -> dead_letter
 ```
 
-Clients can provide an `idempotency_key`; repeated submissions return the existing persisted request. Redis messages are treated as dispatch hints, not authoritative state.
+Clients may provide an `idempotency_key`; repeated submissions return the existing persisted request.
+
+## Integration strategy
+
+The worker selects an adapter rather than embedding every integration inside orchestration logic.
+
+- **Direct API:** preferred when the target exposes a stable supported interface.
+- **RPA gateway:** used when UI automation is the appropriate execution mechanism.
+- **UiPath Orchestrator:** client-credentials token + OData `StartJobs` boundary. The HTTP contract is tested with mocked responses; no live production tenant is claimed.
+
+This keeps the API/RPA choice explicit and replaceable.
 
 ## Security and observability
 
-When `ORCHESTRATOR_API_KEY` is configured, non-public endpoints require `X-API-Key`. HTTP requests receive an `X-Correlation-ID`, and application logs are emitted as structured JSON.
+When `ORCHESTRATOR_API_KEY` is configured, non-public endpoints require `X-API-Key`. Requests receive an `X-Correlation-ID`; application logs are structured; HTTP request count/latency observations are exposed alongside automation lifecycle metrics.
 
 Operational endpoints:
 
@@ -162,15 +109,25 @@ GET /metrics
 GET /metrics/prometheus
 ```
 
-`/health` confirms process liveness. `/ready` checks database connectivity and Redis when broker-backed dispatch is enabled.
-
-The current security control is intentionally reference-level. Enterprise deployment would normally replace the API key with OAuth/OIDC and RBAC and add stronger secrets, network and policy controls.
+The current security model remains reference-level. A real enterprise deployment would normally add OAuth/OIDC, RBAC, stronger secret/network controls, dependency scanning and policy enforcement.
 
 ## Guarded LLM enrichment
 
-`POST /enrichment/documents` calls a configurable OpenAI-compatible endpoint, validates structured output with Pydantic and marks low-confidence results for human review. Invalid or malformed model output fails closed rather than silently entering deterministic automation.
+`POST /enrichment/documents` calls a configurable OpenAI-compatible endpoint, validates structured output with Pydantic and flags low-confidence results for human review. Malformed output fails closed. Included evaluation cases are synthetic and demonstrate an evaluation workflow, not production model accuracy.
 
-The included evaluation cases are synthetic and intentionally small. They demonstrate an evaluation workflow, not production model accuracy.
+## Schema migrations
+
+Alembic is included for managed schema evolution. This replaces treating `metadata.create_all()` as the long-term production migration strategy and makes database changes reviewable and repeatable.
+
+## CI validation
+
+GitHub Actions validates three concerns independently:
+
+1. Ruff quality checks plus unit tests.
+2. Distributed integration against real PostgreSQL and Redis service containers.
+3. Clean container image build.
+
+The distributed test persists a request in PostgreSQL, publishes its ID to Redis, consumes it with the worker, atomically claims it and verifies lifecycle/audit state.
 
 ## Run locally
 
@@ -187,56 +144,31 @@ Worker:
 python -m app.worker
 ```
 
-Swagger/OpenAPI:
-
-```text
-http://127.0.0.1:8000/docs
-```
-
-## CI validation
-
-GitHub Actions separates three concerns:
-
-1. Ruff quality checks plus SQLite unit tests.
-2. A distributed integration test against real PostgreSQL and Redis service containers.
-3. A clean container image build.
-
-The distributed test persists a request in PostgreSQL, publishes its ID to Redis, consumes it with the worker, atomically claims it and verifies final lifecycle/audit state.
-
-## Railway deployment
-
-The live deployment uses:
-
-```text
-Internet -> FastAPI API -> PostgreSQL
-                    |
-                    +-> Redis -> Worker -> API/RPA adapter
-```
-
-See [`docs/deployment-railway.md`](docs/deployment-railway.md) for the verified deployment configuration, start commands and scope.
-
 ## Engineering decisions
 
 See [`docs/decisions/`](docs/decisions/) for ADRs covering persistence, asynchronous execution, AI boundaries, integration design, LLM guardrails, security/observability and distributed state/dispatch.
 
+See [`docs/deployment-railway.md`](docs/deployment-railway.md) for the cloud reference topology and deployment configuration.
+
 ## Roadmap
 
-- [x] v0.1 - API contract and API/RPA routing boundary
-- [x] v0.2 - persistence and audit trail
-- [x] v0.3 - asynchronous request queue and worker
-- [x] v0.4 - retry policy, idempotency and dead-letter state
-- [x] v0.5 - operational metrics, containerization and CI
-- [x] v0.6 - HTTP integration layer for API and RPA execution paths
-- [x] v0.7 - guarded LLM enrichment with typed output, human review and evaluation harness
-- [x] v0.8 - API protection, correlation IDs, structured logging, metrics and UiPath adapter
-- [x] v0.9 - PostgreSQL state, Redis dispatch and multi-worker reference topology
-- [x] v1.0 - distributed CI validation, readiness probes, linting and container-build quality gates
-- [x] cloud deployment - API/worker/PostgreSQL/Redis topology deployed and validated on Railway
-- [ ] enterprise identity - OAuth/OIDC and RBAC
-- [ ] distributed tracing - OpenTelemetry with a real trace backend
-- [ ] schema migrations - replace reference `create_all` initialization with managed migrations
-- [ ] performance validation - load/concurrency testing with explicit SLOs and evidence
+- [x] API/RPA routing boundary
+- [x] persistence and append-only audit trail
+- [x] asynchronous worker execution
+- [x] retries, idempotency and dead-letter handling
+- [x] HTTP integration layer and UiPath boundary
+- [x] guarded LLM enrichment and evaluation harness
+- [x] PostgreSQL state + Redis dispatch
+- [x] real PostgreSQL/Redis CI integration validation
+- [x] readiness, linting and container-build gates
+- [x] Railway reference deployment
+- [x] Alembic schema migrations
+- [x] operational HTTP metrics and latency visibility
+- [ ] persistent managed cloud database/storage for the reference deployment
+- [ ] enterprise identity with OAuth/OIDC and RBAC
+- [ ] distributed tracing with OpenTelemetry
+- [ ] performance/load validation with explicit SLOs
 
 ## Scope
 
-This is a portfolio/reference project. It now provides evidence of designing, testing and deploying a distributed automation architecture to a managed cloud platform, but it does **not** claim enterprise production scale or replace evidence from real professional production environments.
+This repository is evidence of **automation engineering and system-design capability**: selecting integration mechanisms, separating orchestration from execution, designing for recoverability and observability, testing distributed behavior and deploying a reference topology. It does **not** replace evidence from real professional production environments and should not be used to claim Architect/Lead seniority by itself.
