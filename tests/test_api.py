@@ -11,6 +11,11 @@ class SuccessfulAdapter:
         return f"simulated completion for {request.target}"
 
 
+class FailingAdapter:
+    def execute(self, request):
+        raise RuntimeError(f"simulated failure for {request.target}")
+
+
 @pytest.fixture
 def client(tmp_path, monkeypatch):
     db_path = tmp_path / "automation-test.db"
@@ -74,6 +79,59 @@ def test_request_is_queued_then_completed_by_worker(client: TestClient, monkeypa
     audit = client.get(f"/automation-requests/{body['request_id']}/audit")
     statuses = [event["status"] for event in audit.json()["events"]]
     assert statuses == ["queued", "running", "completed"]
+
+
+def test_dead_letter_can_be_replayed_and_completed(client: TestClient, monkeypatch) -> None:
+    monkeypatch.setitem(ADAPTERS, ExecutionChannel.API, FailingAdapter())
+
+    response = client.post(
+        "/automation-requests",
+        json={
+            "process": "invoice_posting",
+            "target": "erp",
+            "execution_channel": "api",
+            "payload": {"invoice_id": "INV-9001"},
+            "max_attempts": 1,
+        },
+    )
+    request_id = response.json()["request_id"]
+
+    worker = AutomationWorker(retry_delay_seconds=0)
+    assert worker.run_once() is True
+    dead_letter = client.get(f"/automation-requests/{request_id}")
+    assert dead_letter.json()["status"] == "dead_letter"
+    assert dead_letter.json()["attempt_count"] == 1
+
+    replay = client.post(f"/automation-requests/{request_id}/replay")
+    assert replay.status_code == 200
+    assert replay.json()["status"] == "queued"
+    assert replay.json()["attempt_count"] == 0
+
+    monkeypatch.setitem(ADAPTERS, ExecutionChannel.API, SuccessfulAdapter())
+    assert worker.run_once() is True
+    completed = client.get(f"/automation-requests/{request_id}")
+    assert completed.json()["status"] == "completed"
+
+    audit = client.get(f"/automation-requests/{request_id}/audit")
+    statuses = [event["status"] for event in audit.json()["events"]]
+    assert statuses == ["queued", "running", "dead_letter", "queued", "running", "completed"]
+
+
+def test_replay_rejects_request_that_is_not_dead_letter(client: TestClient) -> None:
+    response = client.post(
+        "/automation-requests",
+        json={
+            "process": "sync",
+            "target": "crm",
+            "execution_channel": "api",
+            "payload": {},
+        },
+    )
+    request_id = response.json()["request_id"]
+
+    replay = client.post(f"/automation-requests/{request_id}/replay")
+    assert replay.status_code == 409
+    assert replay.json()["detail"] == "Only dead-letter requests can be replayed"
 
 
 def test_idempotency_key_returns_same_request(client: TestClient) -> None:
