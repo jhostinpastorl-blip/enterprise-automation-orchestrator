@@ -52,7 +52,3 @@ class AutomationRequestDetails(AutomationResult):
 class MetricsSnapshot(BaseModel):
     total_requests: int
     by_status: dict[str, int]
-    queue_depth: int = 0
-    retrying_count: int = 0
-    dead_letter_count: int = 0
-    oldest_queued_age_seconds: float | None = None
