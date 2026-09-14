@@ -140,6 +140,56 @@ class AutomationRepository:
             )
             self._append_event(connection, request_id, status, message, now.isoformat())
 
+    def replay_dead_letter(self, request_id: str) -> AutomationResult:
+        now = utc_now()
+        with transaction(immediate=True) as connection:
+            statement = select(automation_requests).where(
+                automation_requests.c.request_id == request_id
+            )
+            if connection.dialect.name == "postgresql":
+                statement = statement.with_for_update()
+            row = connection.execute(statement).mappings().first()
+            if row is None:
+                raise KeyError(request_id)
+            if row["status"] != AutomationStatus.DEAD_LETTER.value:
+                raise ValueError("Only dead-letter requests can be replayed")
+
+            detail = (
+                "Dead-letter replay requested by operator; "
+                "attempt budget reset and request returned to queue"
+            )
+            connection.execute(
+                update(automation_requests)
+                .where(automation_requests.c.request_id == request_id)
+                .values(
+                    status=AutomationStatus.QUEUED.value,
+                    detail=detail,
+                    attempt_count=0,
+                    next_attempt_at=now,
+                    updated_at=now,
+                )
+            )
+            self._append_event(
+                connection,
+                request_id,
+                AutomationStatus.QUEUED,
+                detail,
+                now,
+            )
+            updated = connection.execute(
+                select(
+                    automation_requests.c.request_id,
+                    automation_requests.c.status,
+                    automation_requests.c.execution_channel,
+                    automation_requests.c.detail,
+                    automation_requests.c.attempt_count,
+                    automation_requests.c.max_attempts,
+                    automation_requests.c.created_at,
+                    automation_requests.c.updated_at,
+                ).where(automation_requests.c.request_id == request_id)
+            ).mappings().one()
+        return self._to_result(dict(updated))
+
     def update_status(self, request_id: str, status: AutomationStatus, detail: str) -> None:
         now = utc_now()
         with transaction() as connection:
