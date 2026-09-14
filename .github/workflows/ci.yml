@@ -56,6 +56,44 @@ jobs:
       - run: pip install -e .[dev]
       - run: pytest -m distributed
 
+  admission-benchmark:
+    runs-on: ubuntu-latest
+    env:
+      AUTOMATION_DB_PATH: benchmark.db
+      DISPATCH_BACKEND: database
+      LOG_LEVEL: WARNING
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --upgrade pip
+      - run: pip install -e .[dev]
+      - name: Start API
+        run: |
+          uvicorn app.main:app --host 127.0.0.1 --port 8000 > uvicorn-benchmark.log 2>&1 &
+          echo $! > uvicorn.pid
+          for i in {1..30}; do
+            if curl --fail --silent http://127.0.0.1:8000/health > /dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          cat uvicorn-benchmark.log
+          exit 1
+      - name: Run admission benchmark
+        run: |
+          python scripts/load_test.py \
+            --base-url http://127.0.0.1:8000 \
+            --requests 500 \
+            --concurrency 25 | tee benchmark-result.txt
+      - name: Stop API
+        if: always()
+        run: |
+          if [ -f uvicorn.pid ]; then
+            kill "$(cat uvicorn.pid)" || true
+          fi
+
   container-build:
     runs-on: ubuntu-latest
     steps:
