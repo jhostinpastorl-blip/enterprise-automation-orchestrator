@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from abc import ABC, abstractmethod
+from email.utils import parsedate_to_datetime
 from typing import Any
 
 import httpx
@@ -14,8 +15,42 @@ class AdapterError(RuntimeError):
     """Base exception raised by external execution adapters."""
 
 
+class RetryableAdapterError(AdapterError):
+    """Transient adapter failure carrying an optional downstream retry hint."""
+
+    def __init__(self, message: str, *, retry_after_seconds: int | None = None) -> None:
+        super().__init__(message)
+        self.retry_after_seconds = retry_after_seconds
+
+
 class AdapterConfigurationError(AdapterError):
     """Raised when an adapter is missing required runtime configuration."""
+
+
+def _parse_retry_after(value: str | None) -> int | None:
+    if not value:
+        return None
+    value = value.strip()
+    if value.isdigit():
+        return max(0, int(value))
+    try:
+        retry_at = parsedate_to_datetime(value)
+        if retry_at.tzinfo is None:
+            return None
+        from datetime import UTC, datetime
+
+        return max(0, int((retry_at - datetime.now(UTC)).total_seconds()))
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _raise_for_rate_limit(response: httpx.Response, *, context: str) -> None:
+    if response.status_code == 429:
+        retry_after = _parse_retry_after(response.headers.get("Retry-After"))
+        raise RetryableAdapterError(
+            f"{context} rate limited by downstream service",
+            retry_after_seconds=retry_after,
+        )
 
 
 class AutomationAdapter(ABC):
@@ -52,7 +87,10 @@ class ApiAdapter(AutomationAdapter):
 
         try:
             response = self._post(url, request.payload, headers, timeout)
+            _raise_for_rate_limit(response, context=f"API target '{request.target}'")
             response.raise_for_status()
+        except RetryableAdapterError:
+            raise
         except httpx.HTTPError as exc:
             raise AdapterError(f"API request failed for target '{request.target}': {exc}") from exc
 
@@ -121,6 +159,7 @@ class UiPathOrchestratorAdapter(AutomationAdapter):
                 client_secret=client_secret,
                 timeout=timeout,
             )
+            _raise_for_rate_limit(token_response, context="UiPath token endpoint")
             token_response.raise_for_status()
             access_token = token_response.json()["access_token"]
 
@@ -143,7 +182,10 @@ class UiPathOrchestratorAdapter(AutomationAdapter):
                 }
             }
             response = self._post(start_url, body, headers, timeout)
+            _raise_for_rate_limit(response, context="UiPath job submission")
             response.raise_for_status()
+        except RetryableAdapterError:
+            raise
         except (httpx.HTTPError, KeyError, ValueError) as exc:
             raise AdapterError(f"UiPath Orchestrator submission failed: {exc}") from exc
 
@@ -216,7 +258,10 @@ class RpaAdapter(AutomationAdapter):
 
         try:
             response = self._post(submit_url, body, headers, timeout)
+            _raise_for_rate_limit(response, context=f"RPA process '{request.process}'")
             response.raise_for_status()
+        except RetryableAdapterError:
+            raise
         except httpx.HTTPError as exc:
             raise AdapterError(f"RPA submission failed for process '{request.process}': {exc}") from exc
 
