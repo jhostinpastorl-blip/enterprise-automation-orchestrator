@@ -29,7 +29,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Enterprise Automation Orchestrator",
-    version="1.1.0",
+    version="1.2.0",
     description=(
         "API-first orchestration service for durable enterprise automation workloads "
         "across API and RPA execution channels."
@@ -103,6 +103,22 @@ def get_automation_request_audit(request_id: str) -> AutomationRequestDetails:
     if result is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Automation request not found")
     return result
+
+
+@app.post("/automation-requests/{request_id}/replay", response_model=AutomationResult)
+def replay_dead_letter_request(request_id: str) -> AutomationResult:
+    try:
+        return service.replay_dead_letter(request_id)
+    except KeyError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Automation request not found",
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
 
 
 @app.get("/metrics", response_model=MetricsSnapshot)
