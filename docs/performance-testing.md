@@ -6,6 +6,39 @@ Measure the reference system with explicit numbers instead of describing it as s
 
 The first harness measures **API admission performance**: validation, persistence and dispatch of automation requests. It does not claim end-to-end RPA or downstream-system throughput.
 
+## Measured CI reference baseline
+
+A repeatable GitHub Actions benchmark now runs on every push to `main`.
+
+Reference run characteristics:
+
+- environment: GitHub Actions hosted runner, Ubuntu 24.04;
+- persistence: SQLite reference benchmark database;
+- dispatch mode: database;
+- requests: 500;
+- concurrency: 25;
+- accepted: 500;
+- failed: 0;
+- elapsed: 7.552 seconds;
+- throughput: 66.21 requests/second;
+- mean admission latency: 374.36 ms;
+- p50: 345.65 ms;
+- p95: 730.08 ms;
+- p99: 1619.25 ms;
+- maximum: 1937.26 ms.
+
+These figures are a **single synthetic CI admission baseline**, not a production benchmark. They do not measure PostgreSQL + Redis distributed capacity, worker throughput, UiPath execution, SAP latency or business-process completion time. Hosted-runner performance may also vary between CI executions.
+
+## Provisional engineering target
+
+Until multiple comparable runs exist, this repository does not claim a formal SLO. For the exact CI workload above, the current engineering target is:
+
+- zero admission failures;
+- p95 admission latency below 1 second;
+- no persistence errors.
+
+This is a portfolio/reference target scoped to the synthetic admission test. It must not be represented as a customer-facing or production SLO.
+
 ## Local distributed topology
 
 Start the production-like local topology:
@@ -81,11 +114,15 @@ A future end-to-end benchmark should use a deterministic synthetic adapter so wo
 
 ## SLO discussion
 
-Do not invent an SLO before measuring the system. After several reproducible runs, define a reference objective that is explicitly scoped, for example:
+A formal SLO should be based on repeated comparable measurements, a clearly defined service boundary and a relevant consumer expectation. One CI run is insufficient evidence.
 
-> Under the documented local distributed test environment and workload, 99% of automation submissions should be accepted within the measured threshold while maintaining zero persistence errors.
+A future distributed benchmark should separately define objectives for:
 
-The threshold must come from measured evidence, not from a desired CV statement.
+1. API admission latency and failure rate;
+2. queue wait time;
+3. worker processing latency using a deterministic adapter;
+4. recovery behavior under downstream throttling;
+5. dead-letter and replay behavior.
 
 ## Portfolio evidence
 
