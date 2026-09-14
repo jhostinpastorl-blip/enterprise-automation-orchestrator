@@ -2,7 +2,7 @@ import logging
 import os
 import time
 
-from app.adapters import ADAPTERS
+from app.adapters import ADAPTERS, RetryableAdapterError
 from app.dispatch import DispatchQueue, get_dispatch_queue
 from app.observability import configure_logging
 from app.repository import AutomationRepository
@@ -58,6 +58,22 @@ class AutomationWorker:
 
         try:
             detail = adapter.execute(request)
+        except RetryableAdapterError as exc:
+            retry_delay = (
+                exc.retry_after_seconds
+                if exc.retry_after_seconds is not None
+                else self.retry_delay_seconds
+            )
+            logger.warning(
+                "automation_execution_rate_limited request_id=%s retry_after_seconds=%s",
+                request_id,
+                retry_delay,
+            )
+            self.repository.fail_or_retry(
+                request_id,
+                detail=str(exc),
+                retry_delay_seconds=retry_delay,
+            )
         except Exception as exc:
             logger.exception("automation_execution_failed request_id=%s", request_id)
             self.repository.fail_or_retry(
