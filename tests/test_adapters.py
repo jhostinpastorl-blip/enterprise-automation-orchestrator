@@ -7,6 +7,7 @@ from app.adapters import (
     AdapterConfigurationError,
     AdapterError,
     ApiAdapter,
+    RetryableAdapterError,
     RpaAdapter,
     UiPathOrchestratorAdapter,
 )
@@ -64,6 +65,20 @@ def test_api_adapter_wraps_http_errors() -> None:
 
     with pytest.raises(AdapterError, match="API request failed"):
         adapter.execute(make_request(ExecutionChannel.API))
+
+
+def test_api_adapter_preserves_retry_after_on_429() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, headers={"Retry-After": "17"})
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    adapter = ApiAdapter(base_url="https://example.internal", client=client)
+
+    with pytest.raises(RetryableAdapterError) as exc_info:
+        adapter.execute(make_request(ExecutionChannel.API))
+
+    assert exc_info.value.retry_after_seconds == 17
+    assert "rate limited" in str(exc_info.value)
 
 
 def test_rpa_adapter_submits_vendor_neutral_job_contract(monkeypatch) -> None:
