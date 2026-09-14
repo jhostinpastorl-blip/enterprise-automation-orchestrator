@@ -2,48 +2,103 @@
 
 ## Problem
 
-Enterprise automation rarely lives in one technology. A process may have a stable API for one system and only a graphical interface for another. Long-running execution, transient failures and retries also make a synchronous bot-centric design difficult to operate.
+Enterprise automation rarely lives in one technology. A process may have a stable API for one system, only a graphical interface for another, and an AI enrichment step for unstructured data. Long-running execution, transient failures and retries make a synchronous bot-centric design difficult to operate, recover and audit.
 
-## Boundaries
+The orchestrator therefore treats RPA as one execution mechanism rather than the system of record.
 
-The API accepts and validates requests. It does not execute the automation inline.
+## Current reference architecture
 
-The repository owns durable lifecycle state and audit history.
+```text
+Client
+  |
+  v
+FastAPI --------------------------> PostgreSQL
+  |                                state + audit
+  | publish request ID                 ^
+  v                                    |
+Redis ----------------------------> Worker
+                                      |  |
+                                      |  +--> RPA / UiPath boundary
+                                      +-----> Direct HTTP API
 
-The worker owns execution. It claims eligible work, selects the adapter and records the result.
+Optional AI enrichment is exposed as a guarded service boundary and does not own
+queue state or retry semantics.
+```
 
-Adapters isolate integration technology. An API adapter can call a service directly; an RPA adapter can hand work to a robot platform without putting platform-specific details into orchestration code.
+### Responsibilities
 
-## Reliability choices
+**FastAPI** accepts requests, validates contracts, exposes operational endpoints and returns persisted lifecycle state. It does not run long-lived automation inline.
 
-### Idempotency
+**PostgreSQL** is authoritative for request lifecycle state and append-only audit events in distributed mode. SQLite remains available for low-friction local development.
 
-A caller may retry a submission after a timeout. An idempotency key prevents that network uncertainty from creating duplicate work.
+**Redis** is a dispatch accelerator. It transports request IDs but is not the authoritative queue state. If a broker message is stale or lost, workers fall back to persisted eligible work.
 
-### Retry budget
+**Worker** claims eligible work atomically, selects the requested execution adapter, executes it and records completion, retry or dead-letter state.
 
-Retries are bounded. Permanent failures should not consume workers forever. Exhausted requests move to `dead_letter` so an operator can decide whether to correct data, change configuration or replay work.
+**Adapters** isolate integration technology. A stable supported API is preferred when available; an RPA boundary is used when UI automation is the appropriate mechanism. Vendor-specific details remain outside orchestration logic.
 
-### Audit history
+## Reliability model
 
-Current state and event history are stored separately. Current state keeps operational reads simple; events retain the sequence of lifecycle transitions.
+### Idempotent submission
 
-### Atomic local claims
+A caller may retry a submission after a timeout. An idempotency key prevents network uncertainty from creating duplicate logical work.
 
-SQLite queue claims use an immediate transaction so two local workers cannot select the same pending row before its state changes to `running`.
+### Atomic claims
 
-## Production evolution
+PostgreSQL workers use row locking with `FOR UPDATE SKIP LOCKED` so horizontally scaled workers can claim separate eligible rows without serializing the entire queue. SQLite local mode uses an immediate transaction for equivalent single-database protection.
 
-This repository favors low setup cost over production-scale infrastructure. A larger deployment would normally introduce:
+### Bounded retries and dead letter
 
-1. PostgreSQL or another production datastore for request state.
-2. A managed queue or broker for distributed work delivery.
-3. Platform-specific adapters for UiPath, Automation Anywhere or other execution engines.
-4. Authentication/authorization and secrets management.
-5. Distributed traces, structured logs and metrics exported to an observability platform.
-6. Explicit replay tooling for dead-letter work.
-7. Horizontal worker scaling and rate limits per downstream system.
+Retries are deliberately finite. Permanent failures should not consume worker capacity forever. Exhausted work moves to `dead_letter` and requires an explicit operator replay.
 
-## AI extension
+### Auditable replay
 
-LLM-based classification or extraction should be an enrichment stage, not part of the queue/retry state machine. The model should return validated structured output and uncertain cases should route to human review. This keeps deterministic operational behavior independent from model variability.
+`POST /automation-requests/{request_id}/replay` only accepts requests currently in `dead_letter`. Replay returns the same logical request to `queued`, resets its attempt budget and appends a new lifecycle event. Reusing the same request ID preserves continuity of the audit trail while making the operator action visible.
+
+This is a conscious trade-off: the current reference model optimizes for a single logical request history. A stricter enterprise implementation could model execution attempts or replays as separate first-class entities linked to the original request.
+
+### Broker recovery
+
+Redis dispatch does not make delivery authoritative. After consuming an ID the worker must still claim the persisted request. If the message is stale, duplicate or missing, durable state determines whether work is eligible.
+
+## Observability
+
+The reference implementation currently includes:
+
+- correlation IDs propagated through HTTP responses and structured logs;
+- liveness and dependency-aware readiness probes;
+- lifecycle status metrics;
+- HTTP request count and latency observations;
+- append-only lifecycle audit events.
+
+The next observability step is distributed tracing with OpenTelemetry so one execution can be followed across API admission, persistence, dispatch, worker claim and downstream adapter calls.
+
+## Security boundary
+
+The current reference deployment supports API-key protection for non-public endpoints and keeps configuration outside source control. This is intentionally not presented as enterprise identity.
+
+A production enterprise deployment would normally add OAuth/OIDC, RBAC, managed secrets, private networking where appropriate, dependency/image scanning and policy enforcement.
+
+## AI boundary
+
+LLM-based classification or extraction is treated as enrichment, not as the owner of deterministic workflow state. Model output is validated as structured data; malformed output fails closed and low-confidence results can require human review.
+
+This separation keeps queue/retry behavior deterministic even when model behavior is probabilistic.
+
+## Current limitations and deliberate next steps
+
+The project already demonstrates PostgreSQL-backed durable state, Redis dispatch, distributed worker claims, API/RPA integration boundaries, guarded LLM enrichment, CI validation and a Railway reference deployment.
+
+The remaining work is intentionally focused on operational depth rather than adding technologies for appearance:
+
+1. Per-target rate limiting and backpressure, including explicit handling for `429` and `Retry-After`.
+2. Exponential backoff with jitter to reduce synchronized retry storms.
+3. OpenTelemetry traces across request admission, queueing, worker execution and downstream calls.
+4. Load/performance validation with documented concurrency, throughput and p50/p95/p99 latency.
+5. Explicit SLOs and saturation signals such as queue depth and oldest-work age.
+6. Enterprise identity/authorization and stronger secrets/network controls.
+7. Persistent managed cloud storage for the public reference deployment.
+
+## Design principle
+
+The repository is intentionally opinionated about one point: **orchestration state must survive outside the robot**. RPA, APIs and AI can all participate in the same business process, but reliability, recoverability and auditability belong to the orchestration layer rather than an individual execution technology.
