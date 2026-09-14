@@ -25,6 +25,13 @@ class AutomationService:
             raise RuntimeError(f"Request {request_id} was not persisted")
         return result
 
+    def replay_dead_letter(self, request_id: str) -> AutomationResult:
+        result = self.repository.replay_dead_letter(request_id)
+        dispatcher = self.dispatch or get_dispatch_queue()
+        if dispatcher.brokered:
+            dispatcher.publish(request_id)
+        return result
+
     def get(self, request_id: str) -> AutomationResult | None:
         return self.repository.get(request_id)
 
